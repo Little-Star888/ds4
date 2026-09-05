@@ -41,6 +41,7 @@
 #include <unistd.h>
 
 #include "ds4.h"
+#include "ds4_tool_text.h"
 #include "ds4_distributed.h"
 #include "ds4_image.h"
 #include "ds4_tp.h"
@@ -39823,13 +39824,12 @@ static void bpe_tokenize_wrapped_payload_text(ds4_vocab *vocab, const char *cont
      * Preserve literal '<', '>' and '&' so shell output and file snippets stay
      * intact, but escape the exact closing sentinel so a malicious or accidental
      * tool payload cannot terminate the wrapper early. */
-    const size_t endlen = strlen(end);
     const char *span = content ? content : "";
     const char *p = span;
     while (*p) {
-        if (!strncmp(p, end, endlen)) {
+        if (ds4_tool_text_needs_escape(p, end)) {
             tokenize_span(vocab, span, (size_t)(p - span), out);
-            bpe_tokenize_text(vocab, "&lt;", out);
+            bpe_tokenize_text(vocab, *p == '<' ? "&lt;" : "&amp;", out);
             p++;
             span = p;
         } else {

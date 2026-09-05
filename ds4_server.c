@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_tool_text.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
@@ -2624,10 +2625,9 @@ static void append_dsml_attr_escaped(buf *b, const char *s) {
 
 static void append_dsml_parameter_text(buf *b, const char *s) {
     const char *end = "</｜DSML｜parameter>";
-    const size_t endlen = strlen(end);
     for (s = s ? s : ""; *s;) {
-        if (!strncmp(s, end, endlen)) {
-            buf_puts(b, "&lt;");
+        if (ds4_tool_text_needs_escape(s, end)) {
+            buf_puts(b, *s == '<' ? "&lt;" : "&amp;");
             s++;
         } else {
             buf_putc(b, *s++);
@@ -2636,10 +2636,9 @@ static void append_dsml_parameter_text(buf *b, const char *s) {
 }
 
 static void append_glm_tag_body_text(buf *b, const char *s, const char *end) {
-    const size_t endlen = strlen(end);
     for (s = s ? s : ""; *s;) {
-        if (!strncmp(s, end, endlen)) {
-            buf_puts(b, "&lt;");
+        if (ds4_tool_text_needs_escape(s, end)) {
+            buf_puts(b, *s == '<' ? "&lt;" : "&amp;");
             s++;
         } else {
             buf_putc(b, *s++);
@@ -2704,10 +2703,9 @@ static void append_tool_result_text(buf *b, const char *s) {
      * protect is the wrapper's own closing tag; otherwise a file containing that
      * exact sentinel would terminate the result early. */
     const char *end = "</tool_result>";
-    const size_t endlen = strlen(end);
     for (s = s ? s : ""; *s;) {
-        if (!strncmp(s, end, endlen)) {
-            buf_puts(b, "&lt;");
+        if (ds4_tool_text_needs_escape(s, end)) {
+            buf_puts(b, *s == '<' ? "&lt;" : "&amp;");
             s++;
         } else {
             buf_putc(b, *s++);
@@ -5316,10 +5314,8 @@ static const char *find_tool_structural_text(const char *s, const char *needle,
     return found;
 }
 
-/* The prompt renderer escapes DSML text so a tool argument can safely contain
- * shell operators or closing tags.  The generated-DSML parser must undo exactly
- * those entities before it turns parameters back into JSON; otherwise
- * parse->render is not a stable cache key. */
+/* Attributes are XML-escaped. Argument bodies are literal data and use the
+ * narrower closing-delimiter escape from ds4_tool_text.h instead. */
 static char *dsml_unescape_text(const char *s) {
     buf b = {0};
     for (s = s ? s : ""; *s; s++) {
@@ -5412,8 +5408,8 @@ static bool dsml_parse_leaf_param_json(const char **p_in, const char *param_star
 
     char *raw_value = xstrndup(value_start, (size_t)(value_end - value_start));
     const char *type = is_string ? is_string : "true";
-    char *value = !strcmp(type, "true") ?
-        dsml_unescape_text(raw_value) : xstrdup(raw_value);
+    char *value = xstrdup(raw_value);
+    if (!strcmp(type, "true")) ds4_tool_text_unescape(value, param_end);
     tool_call_json_args_add(out, name, value, type);
 
     free(name);
@@ -5680,8 +5676,8 @@ static bool parse_deepseek_generated_message_ex(const char *text,
             }
             char *raw_value = xstrndup(value_start, (size_t)(value_end - value_start));
             const char *type = param_is_string ? param_is_string : "true";
-            char *value = !strcmp(type, "true") ?
-                dsml_unescape_text(raw_value) : xstrdup(raw_value);
+            char *value = xstrdup(raw_value);
+            if (!strcmp(type, "true")) ds4_tool_text_unescape(value, param_end);
             tool_call_json_args_add(&args, param_name, value, type);
             free(param_name);
             free(param_is_string);
@@ -5791,7 +5787,8 @@ static bool parse_glm_generated_message_ex(const char *text,
             const char *key_trim_end = key_end;
             trim_const_span(&key_start, &key_trim_end);
             char *raw_key = xstrndup(key_start, (size_t)(key_trim_end - key_start));
-            char *key = dsml_unescape_text(raw_key);
+            char *key = xstrdup(raw_key);
+            ds4_tool_text_unescape(key, arg_key_end);
             free(raw_key);
 
             p = key_end + strlen(arg_key_end);
@@ -5811,7 +5808,8 @@ static bool parse_glm_generated_message_ex(const char *text,
                 return false;
             }
             char *raw_value = xstrndup(p, (size_t)(value_end - p));
-            char *value = dsml_unescape_text(raw_value);
+            char *value = xstrdup(raw_value);
+            ds4_tool_text_unescape(value, arg_value_end);
             tool_call_json_args_add(&args, key, value, "true");
             free(key);
             free(raw_value);
@@ -6909,23 +6907,6 @@ static void observe_tool_markers(const dsml_decode_tracker *tracker,
         *orphan_end = true;
 }
 
-static size_t dsml_entity_stream_safe_len(const char *raw, size_t start, size_t limit) {
-    static const char *ents[] = {"&amp;", "&lt;", "&gt;", "&quot;", "&apos;"};
-    const size_t max_ent = 6;
-    size_t scan = limit > start + max_ent ? limit - max_ent : start;
-    for (size_t i = limit; i > scan; i--) {
-        if (raw[i - 1] != '&') continue;
-        size_t amp = i - 1;
-        size_t tail = limit - amp;
-        for (size_t ei = 0; ei < sizeof(ents) / sizeof(ents[0]); ei++) {
-            size_t elen = strlen(ents[ei]);
-            if (tail < elen && !memcmp(raw + amp, ents[ei], tail)) return amp;
-        }
-        break;
-    }
-    return limit;
-}
-
 static size_t tool_param_value_stream_safe_len(const char *raw, size_t start,
                                                size_t raw_len, const char *param_end,
                                                bool is_string) {
@@ -6939,7 +6920,14 @@ static size_t tool_param_value_stream_safe_len(const char *raw, size_t start,
         if (tail < end_len && !memcmp(raw + marker, param_end, tail)) limit = marker;
         break;
     }
-    if (is_string) limit = dsml_entity_stream_safe_len(raw, start, limit);
+    if (is_string) {
+        for (size_t i = limit; i > start; i--) {
+            if (raw[i - 1] != '&') continue;
+            if (ds4_tool_text_partial_escape(raw + i - 1, limit - i + 1, param_end))
+                limit = i - 1;
+            break;
+        }
+    }
     return utf8_stream_safe_len(raw, start, limit, false);
 }
 
@@ -6954,12 +6942,11 @@ static bool openai_tool_emit_string_value(int fd, const request *r, const char *
                                           const char *text, size_t len) {
     if (len == 0) return true;
     char *raw = xstrndup(text, len);
-    char *unescaped = dsml_unescape_text(raw);
+    ds4_tool_text_unescape(raw, ts->param_end);
     buf frag = {0};
-    json_escape_fragment_n(&frag, unescaped, strlen(unescaped));
+    json_escape_fragment_n(&frag, raw, strlen(raw));
     bool ok = openai_tool_emit_args_fragment(fd, r, id, ts, frag.ptr ? frag.ptr : "", frag.len);
     buf_free(&frag);
-    free(unescaped);
     free(raw);
     return ok;
 }
@@ -8539,14 +8526,13 @@ static bool anthropic_tool_emit_string_value(int fd, anthropic_stream *st,
                                              const char *text, size_t len) {
     if (len == 0) return true;
     char *raw = xstrndup(text, len);
-    char *unescaped = dsml_unescape_text(raw);
+    ds4_tool_text_unescape(raw, st->tool.syn->param_end);
     buf frag = {0};
-    json_escape_fragment_n(&frag, unescaped, strlen(unescaped));
+    json_escape_fragment_n(&frag, raw, strlen(raw));
     bool ok = anthropic_tool_emit_args_fragment(fd, st,
                                                 frag.ptr ? frag.ptr : "",
                                                 frag.len);
     buf_free(&frag);
-    free(unescaped);
     free(raw);
     return ok;
 }
@@ -15784,7 +15770,7 @@ static void test_openai_tool_stream_sends_partial_raw_arguments(void) {
     close(sv[1]);
 }
 
-static void test_openai_tool_stream_holds_partial_dsml_entities(void) {
+static void test_openai_tool_stream_preserves_literal_entities(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] < 0 || sv[1] < 0) return;
@@ -15818,8 +15804,7 @@ static void test_openai_tool_stream_holds_partial_dsml_entities(void) {
     char *out = read_socket_text(sv[1]);
 
     TEST_ASSERT(strstr(out, "\"arguments\":\"echo \"") != NULL);
-    TEST_ASSERT(strstr(out, "\"arguments\":\"& done\"") != NULL);
-    TEST_ASSERT(strstr(out, "&amp") == NULL);
+    TEST_ASSERT(strstr(out, "\"arguments\":\"&amp; done\"") != NULL);
 
     free(out);
     openai_stream_free(&st);
@@ -16507,7 +16492,7 @@ static void test_dsml_parser_recovers_loose_nested_parameters(void) {
     TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "edit"));
     TEST_ASSERT(strstr(calls.v[0].arguments, "\"path\": \"/private/tmp/tetris.c\"") != NULL);
     TEST_ASSERT(strstr(calls.v[0].arguments, "\"edits\": {") != NULL);
-    TEST_ASSERT(strstr(calls.v[0].arguments, "\"oldText\":\"old <text>\"") != NULL);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"oldText\":\"old &lt;text&gt;\"") != NULL);
     TEST_ASSERT(strstr(calls.v[0].arguments, "\"newText\":\"new text\"") != NULL);
 
     free(content);
@@ -17792,6 +17777,60 @@ static void test_tool_control_text_inside_arguments(void) {
         free(content);
         free(reasoning);
         tool_calls_free(&calls);
+        buf_free(&raw);
+    }
+}
+
+static void test_tool_body_escape_round_trip(void) {
+    const char *ends[] = {DS4_PARAM_END, "</arg_key>", "</arg_value>",
+                         "</tool_result>", "</tool_response>"};
+    for (size_t i = 0; i < sizeof(ends) / sizeof(ends[0]); i++) {
+        buf input = {0}, encoded = {0}, streamed = {0};
+        buf_printf(&input, "&amp; &lt; &gt; &quot; &apos; <html> %s &lt;%s &amp;lt;%s &amp;amp;lt;%s end",
+                   ends[i], ends[i] + 1, ends[i] + 1, ends[i] + 1);
+        append_glm_tag_body_text(&encoded, input.ptr, ends[i]);
+        char *decoded = xstrdup(encoded.ptr);
+        ds4_tool_text_unescape(decoded, ends[i]);
+        TEST_ASSERT(!strcmp(input.ptr, decoded));
+        free(decoded);
+        size_t sent = 0;
+        for (size_t n = 1; n <= encoded.len; n++) {
+            size_t safe = tool_param_value_stream_safe_len(encoded.ptr, sent, n, ends[i], true);
+            TEST_ASSERT(safe >= sent && safe <= n);
+            char *part = xstrndup(encoded.ptr + sent, safe - sent);
+            ds4_tool_text_unescape(part, ends[i]);
+            buf_puts(&streamed, part);
+            free(part);
+            sent = safe;
+        }
+        TEST_ASSERT(sent == encoded.len);
+        TEST_ASSERT(!strcmp(input.ptr, streamed.ptr));
+        buf_free(&input);
+        buf_free(&encoded);
+        buf_free(&streamed);
+    }
+    for (int glm = 0; glm <= 1; glm++) {
+        tool_calls original = {0}, parsed = {0};
+        tool_call tc = {.name = xstrdup("write"),
+            .arguments = xstrdup("{\"content\":\"<p>&amp; &lt; &quot; &apos;</p>\"}")};
+        tool_calls_push(&original, tc);
+        buf raw = {0};
+        server_model_syntax syntax = glm ? SERVER_MODEL_SYNTAX_GLM : SERVER_MODEL_SYNTAX_DEEPSEEK;
+        append_tool_calls_text_for_syntax(&raw, syntax, &original, NULL);
+        char *content = NULL, *reasoning = NULL;
+        TEST_ASSERT(parse_generated_message_ex_for_syntax(syntax, raw.ptr, false,
+            &content, &reasoning, &parsed));
+        TEST_ASSERT(parsed.len == 1);
+        if (parsed.len) {
+            json_args args = {0};
+            TEST_ASSERT(json_args_parse(parsed.v[0].arguments, &args));
+            TEST_ASSERT(args.len == 1 && !strcmp(args.v[0].value, "<p>&amp; &lt; &quot; &apos;</p>"));
+            json_args_free(&args);
+        }
+        free(content);
+        free(reasoning);
+        tool_calls_free(&original);
+        tool_calls_free(&parsed);
         buf_free(&raw);
     }
 }
@@ -19702,7 +19741,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_glm_tool_stream_suppresses_raw_tool_call();
     test_openai_tool_stream_waits_for_incomplete_tool_tags();
     test_openai_tool_stream_sends_partial_raw_arguments();
-    test_openai_tool_stream_holds_partial_dsml_entities();
+    test_openai_tool_stream_preserves_literal_entities();
     test_openai_tool_stream_holds_partial_utf8_arguments();
     test_openai_tool_stream_handles_multiple_calls();
     test_streaming_holds_partial_utf8();
@@ -19734,6 +19773,7 @@ static void ds4_server_unit_tests_run(void) {
     test_decode_tracker_split_parameter_close();
     test_glm_decode_tracker_boundaries();
     test_tool_control_text_inside_arguments();
+    test_tool_body_escape_round_trip();
     test_tool_memory_max_ids_prunes_oldest();
     test_kv_tool_map_filters_by_dsml_text();
     test_kv_tool_map_restores_before_prompt_render();

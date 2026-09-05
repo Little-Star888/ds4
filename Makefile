@@ -46,6 +46,7 @@ NVCC_ARCH_FLAGS := -gencode arch=compute_121a,code=sm_121a -DDS4_CUDA_HAVE_MXF4=
 else
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
+
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 # Vendored llama.cpp mmq prefill tier (cuda/mmq/, see cuda/mmq/VENDOR.md).
@@ -730,6 +731,10 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 test-quality-api: tests/test_quality_api.c gguf-tools/quality-testing/score_official.c
 	$(CC) $(QUALITY_CFLAGS) -I. -ffunction-sections -fdata-sections -o tests/test_quality_api tests/test_quality_api.c -Wl,$(if $(filter Darwin,$(UNAME_S)),-dead_strip,--gc-sections) -lm
 	./tests/test_quality_api
+
+ds4.o ds4_cpu.o ds4_agent.o ds4_agent_cpu.o ds4_server.o ds4_server_cpu.o \
+ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_session_state.o \
+tests/test_session_state_gpu.o: ds4_tool_text.h
 
 clean:
 	rm -f tests/test_cuda_q8_scratch
