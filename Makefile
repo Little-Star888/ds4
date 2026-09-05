@@ -678,6 +678,11 @@ tests/test_prompt_prefix.o: tests/test_prompt_prefix.c ds4_prompt_prefix.h
 tests/test_prompt_prefix: tests/test_prompt_prefix.o ds4_prompt_prefix.o
 	$(CC) $(CFLAGS) -o $@ $^
 
+.PHONY: test-frontends
+test-frontends: ds4_test ds4_agent_test
+	./ds4_test --server
+	./ds4_agent_test
+
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-linux-memory \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	tests/test_deepseek4_vision_image tests/test_prompt_prefix $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
@@ -733,6 +738,7 @@ test-quality-api: tests/test_quality_api.c gguf-tools/quality-testing/score_offi
 	./tests/test_quality_api
 
 ds4.o ds4_cpu.o ds4_agent.o ds4_agent_cpu.o ds4_server.o ds4_server_cpu.o \
+ds4_test.o ds4_agent_test.o \
 ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_session_state.o \
 tests/test_session_state_gpu.o: ds4_tool_text.h
 
