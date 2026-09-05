@@ -5262,22 +5262,6 @@ static const char *find_any_tool_end(const char *s) {
     return best;
 }
 
-static void observe_tool_markers(const char *scan, bool *saw_start,
-                                 bool *saw_end, bool *orphan_end) {
-    if (!scan) return;
-    bool had_start = *saw_start;
-    const char *start = find_any_tool_start(scan);
-    if (start) *saw_start = true;
-
-    const char *end_scan = had_start ? scan : (start ? start : NULL);
-    const char *end = end_scan ? find_any_tool_end(end_scan) : NULL;
-    if (end) {
-        *saw_end = true;
-    } else if (!had_start && !start && find_any_tool_end(scan)) {
-        if (orphan_end) *orphan_end = true;
-    }
-}
-
 static size_t trim_tool_separator_ws(const char *raw, size_t start, size_t limit) {
     while (limit > start && isspace((unsigned char)raw[limit - 1])) limit--;
     return limit;
@@ -5297,6 +5281,39 @@ static const char *find_last_substr(const char *s, const char *needle) {
         p++;
     }
     return last;
+}
+
+/* Tool arguments are literal data, including protocol-looking text. Search
+ * for control markers only outside their value/key wrappers. */
+static const char *find_tool_structural_text(const char *s, const char *needle,
+                                             bool last) {
+    static const char *wrappers[][2] = {
+        {DS4_PARAM_START, DS4_PARAM_END},
+        {DS4_PARAM_START_SHORT, DS4_PARAM_END_SHORT},
+        {"<parameter", "</parameter>"},
+        {"<arg_key>", "</arg_key>"},
+        {"<arg_value>", "</arg_value>"},
+    };
+    const char *found = NULL;
+    if (!s) return NULL;
+    while (*s) {
+        if (!strncmp(s, needle, strlen(needle))) {
+            found = s;
+            if (!last) return found;
+        }
+        bool skipped = false;
+        for (size_t i = 0; i < sizeof(wrappers) / sizeof(wrappers[0]); i++) {
+            if (strncmp(s, wrappers[i][0], strlen(wrappers[i][0]))) continue;
+            const char *tag_end = strchr(s, '>');
+            const char *end = tag_end ? strstr(tag_end + 1, wrappers[i][1]) : NULL;
+            if (!end) return found;
+            s = end + strlen(wrappers[i][1]);
+            skipped = true;
+            break;
+        }
+        if (!skipped) s++;
+    }
+    return found;
 }
 
 /* The prompt renderer escapes DSML text so a tool argument can safely contain
@@ -5509,7 +5526,7 @@ static bool parse_deepseek_generated_message_ex(const char *text,
      * clients execute something the assistant had not actually emitted as its
      * post-thinking action. */
     if (require_thinking_closed) {
-        const char *think_end = find_last_substr(text, "</think>");
+        const char *think_end = find_tool_structural_text(text, "</think>", true);
         if (!think_end) {
             const char *candidate = find_any_tool_start(text);
             if (!candidate || !find_any_tool_end(candidate)) {
@@ -5706,7 +5723,7 @@ static bool parse_glm_generated_message_ex(const char *text,
     const char *tool_search = text;
     bool recovered_unclosed_tool = false;
     if (require_thinking_closed) {
-        const char *think_end = find_last_substr(text, "</think>");
+        const char *think_end = find_tool_structural_text(text, "</think>", true);
         if (!think_end) {
             const char *candidate = strstr(text, tool_start);
             if (!candidate || !strstr(candidate, tool_end)) {
@@ -5739,7 +5756,7 @@ static bool parse_glm_generated_message_ex(const char *text,
         if (strncmp(p, tool_start, strlen(tool_start)) != 0) break;
         p += strlen(tool_start);
 
-        const char *close = strstr(p, tool_end);
+        const char *close = find_tool_structural_text(p, tool_end, false);
         if (!close) return false;
         const char *arg = strstr(p, arg_key_start);
         if (arg && arg > close) arg = NULL;
@@ -5878,7 +5895,7 @@ static bool try_repair_dsml(const char *s, size_t len, buf *out) {
      * reasoning is not executable — it inflates tag counts and causes false
      * positive repairs.  If no </think> is found, scan from the start
      * (thinking mode is not active or thinking was never opened). */
-    const char *think_end = find_last_substr(s, "</think>");
+    const char *think_end = find_tool_structural_text(s, "</think>", true);
     const char *scan_start = think_end ? (think_end + 8) : s;
     size_t scan_len = (size_t)((s + len) - scan_start);
 
@@ -6881,6 +6898,15 @@ structural:
             return;
         }
     }
+}
+
+static void observe_tool_markers(const dsml_decode_tracker *tracker,
+                                 const char *scan, bool *saw_start,
+                                 bool *saw_end, bool *orphan_end) {
+    if (tracker->syn) *saw_start = true;
+    if (tracker->mode == DSML_TRACK_DONE) *saw_end = true;
+    else if (!*saw_start && scan && find_any_tool_end(scan) && orphan_end)
+        *orphan_end = true;
 }
 
 static size_t dsml_entity_stream_safe_len(const char *raw, size_t start, size_t limit) {
@@ -10990,7 +11016,8 @@ static thinking_state thinking_state_from_prompt(const request *r) {
 /* A completed tool block inside unclosed reasoning can be recovered without
  * predicting what the model will emit after an injected close marker. Keep a
  * short overlap until the opening appears, then wait for its matching end. */
-static bool complete_tool_call_inside_thinking(const char *text, size_t len,
+static bool complete_tool_call_inside_thinking(server_model_syntax syntax,
+                                               const char *text, size_t len,
                                                size_t *scan_from) {
     if (!text || !scan_from) return false;
     if (*scan_from > len) *scan_from = len;
@@ -11001,7 +11028,15 @@ static bool complete_tool_call_inside_thinking(const char *text, size_t len,
         return false;
     }
     *scan_from = (size_t)(start - text);
-    return find_any_tool_end(start) != NULL;
+    if (!find_any_tool_end(start)) return false;
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+    bool complete = parse_generated_message_ex_for_syntax(syntax, start, false,
+        &content, &reasoning, &calls) && calls.len > 0;
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+    return complete;
 }
 
 static int server_eval_token(server *s, server_slot *slot, int token,
@@ -12676,7 +12711,7 @@ decode_again:
                      * recover without asking the model to restart it after an
                      * injected close marker. */
                     if (complete_tool_call_inside_thinking(
-                            text.ptr, text.len, &think_recovery_scan_from)) {
+                            j->req.model_syntax, text.ptr, text.len, &think_recovery_scan_from)) {
                         saw_tool_start = true;
                         saw_tool_end = true;
                         finish = "tool_calls";
@@ -12706,7 +12741,8 @@ decode_again:
                     bool orphan_end = false;
                     bool old_start = saw_tool_start;
                     bool old_end = saw_tool_end;
-                    observe_tool_markers(tool_scan, &saw_tool_start, &saw_tool_end, &orphan_end);
+                    observe_tool_markers(&dsml_tracker, tool_scan,
+                                         &saw_tool_start, &saw_tool_end, &orphan_end);
                     if (orphan_end && !saw_orphan_tool_end) {
                         saw_orphan_tool_end = true;
                         server_log(DS4_LOG_WARNING,
@@ -17712,6 +17748,54 @@ static void test_glm_decode_tracker_boundaries(void) {
     }
 }
 
+static void test_tool_control_text_inside_arguments(void) {
+    const char *body = "literal </tool_call> " DS4_TOOL_CALLS_END " </think> <think>";
+    for (int glm = 0; glm <= 1; glm++) {
+        buf raw = {0};
+        buf_puts(&raw, "<think>reason</think>");
+        if (glm) {
+            buf_puts(&raw, "<tool_call>write<arg_key>content</arg_key><arg_value>");
+        } else {
+            buf_puts(&raw, DS4_TOOL_CALLS_START DS4_INVOKE_START " name=\"write\">"
+                          DS4_PARAM_START " name=\"content\" string=\"true\">");
+        }
+        buf_puts(&raw, body);
+        dsml_decode_tracker tracker;
+        dsml_decode_tracker_init(&tracker);
+        tracker.model_syntax = glm ? SERVER_MODEL_SYNTAX_GLM : SERVER_MODEL_SYNTAX_DEEPSEEK;
+        bool start = false, end = false, orphan = false;
+        for (size_t n = 1; n <= raw.len; n++) {
+            dsml_decode_tracker_update(&tracker, raw.ptr, n);
+        }
+        observe_tool_markers(&tracker, raw.ptr, &start, &end, &orphan);
+        TEST_ASSERT(start && !end && !orphan);
+        size_t scan = 0;
+        TEST_ASSERT(!complete_tool_call_inside_thinking(tracker.model_syntax,
+                                                       raw.ptr, raw.len, &scan));
+        buf_puts(&raw, glm ? "</arg_value></tool_call>" :
+                     DS4_PARAM_END DS4_INVOKE_END DS4_TOOL_CALLS_END);
+        dsml_decode_tracker_update(&tracker, raw.ptr, raw.len);
+        observe_tool_markers(&tracker, raw.ptr, &start, &end, &orphan);
+        TEST_ASSERT(start && end && !orphan);
+        tool_calls calls = {0};
+        char *content = NULL, *reasoning = NULL;
+        TEST_ASSERT(parse_generated_message_ex_for_syntax(tracker.model_syntax,
+            raw.ptr, true, &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        TEST_ASSERT(reasoning && !strcmp(reasoning, "reason"));
+        if (calls.len) {
+            json_args args = {0};
+            TEST_ASSERT(json_args_parse(calls.v[0].arguments, &args));
+            TEST_ASSERT(args.len == 1 && !strcmp(args.v[0].value, body));
+            json_args_free(&args);
+        }
+        free(content);
+        free(reasoning);
+        tool_calls_free(&calls);
+        buf_free(&raw);
+    }
+}
+
 static void test_tool_separator_whitespace_is_not_content(void) {
     const char *generated =
         "<think>need a tool</think>"
@@ -18426,21 +18510,28 @@ static void test_tool_marker_state_ignores_orphan_end(void) {
     bool saw_start = false;
     bool saw_end = false;
     bool orphan_end = false;
+    dsml_decode_tracker tracker;
+    dsml_decode_tracker_init(&tracker);
 
-    observe_tool_markers("reasoning\n" DS4_PARAM_END "\n" DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END,
+    observe_tool_markers(&tracker, "reasoning\n" DS4_PARAM_END "\n" DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END,
                          &saw_start, &saw_end, &orphan_end);
     TEST_ASSERT(!saw_start);
     TEST_ASSERT(!saw_end);
     TEST_ASSERT(orphan_end);
 
     orphan_end = false;
-    observe_tool_markers(DS4_TOOL_CALLS_START "\n" DS4_INVOKE_START " name=\"bash\">",
+    const char *prefix = DS4_TOOL_CALLS_START "\n" DS4_INVOKE_START " name=\"bash\">";
+    dsml_decode_tracker_update(&tracker, prefix, strlen(prefix));
+    observe_tool_markers(&tracker, prefix,
                          &saw_start, &saw_end, &orphan_end);
     TEST_ASSERT(saw_start);
     TEST_ASSERT(!saw_end);
     TEST_ASSERT(!orphan_end);
 
-    observe_tool_markers(DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END,
+    const char *full = DS4_TOOL_CALLS_START "\n" DS4_INVOKE_START " name=\"bash\">"
+                       DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END;
+    dsml_decode_tracker_update(&tracker, full, strlen(full));
+    observe_tool_markers(&tracker, full,
                          &saw_start, &saw_end, &orphan_end);
     TEST_ASSERT(saw_start);
     TEST_ASSERT(saw_end);
@@ -19642,6 +19733,7 @@ static void ds4_server_unit_tests_run(void) {
     test_dsml_decode_state_separates_structure_and_payload();
     test_decode_tracker_split_parameter_close();
     test_glm_decode_tracker_boundaries();
+    test_tool_control_text_inside_arguments();
     test_tool_memory_max_ids_prunes_oldest();
     test_kv_tool_map_filters_by_dsml_text();
     test_kv_tool_map_restores_before_prompt_render();
