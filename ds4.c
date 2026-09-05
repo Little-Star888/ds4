@@ -56140,6 +56140,10 @@ bool ds4_engine_has_mtp(ds4_engine *e) {
            e->mtp_ready;
 }
 
+bool ds4_engine_mtp_exact_sampling(ds4_engine *e) {
+    return e && e->dspark_exact_sampling;
+}
+
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     if (e && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 ? 2 : 0;

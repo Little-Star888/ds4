@@ -12794,7 +12794,10 @@ decode_again:
             const bool next_greedy = !thinking.inside &&
                 dsml_decode_state_is_tool(dsml_tracker.decode) &&
                 !dsml_decode_state_uses_payload_sampling(dsml_tracker.decode);
-            if (ti + 1 < ntok && payload_temperature > 0.0f &&
+            /* Opportunistic drafts are greedy under both parser modes.
+             * Only exact sampling changes their acceptance distribution. */
+            if (ti + 1 < ntok && ds4_engine_mtp_exact_sampling(s->engine) &&
+                payload_temperature > 0.0f &&
                 next_greedy != greedy_tool_syntax) {
                 resample = true;
                 break;

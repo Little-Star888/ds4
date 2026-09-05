@@ -9346,7 +9346,10 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                     break;
                 }
 
-                if (ti + 1 < ntok && next_greedy != greedy_sampling) {
+                /* Opportunistic drafts already match greedy continuation in
+                 * either mode; only exact sampling needs a new distribution. */
+                if (ti + 1 < ntok && ds4_engine_mtp_exact_sampling(w->engine) &&
+                    cfg->gen.temperature > 0.0f && next_greedy != greedy_sampling) {
                     /* Later tokens were proposed under the old parser mode.
                      * Re-evaluate this boundary token to restore its logits,
                      * then sample the suffix under the new mode. */
