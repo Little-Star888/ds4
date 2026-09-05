@@ -6531,14 +6531,6 @@ typedef struct {
     bool json_escaped;
 } dsml_decode_tracker;
 
-static bool raw_partial_lit_min(const char *raw, size_t raw_len, size_t pos,
-                                const char *lit, size_t min_len) {
-    size_t lit_len = strlen(lit);
-    if (!raw || pos > raw_len || raw_len - pos >= lit_len) return false;
-    size_t avail = raw_len - pos;
-    return avail >= min_len && !memcmp(raw + pos, lit, avail);
-}
-
 static size_t dsml_max_tool_start_len(void) {
     size_t max = 0;
     for (size_t i = 0; i < sizeof(dsml_syntaxes) / sizeof(dsml_syntaxes[0]); i++) {
@@ -6755,8 +6747,11 @@ static void dsml_decode_tracker_update(dsml_decode_tracker *dt,
                     dt->decode = DSML_DECODE_STRUCTURAL;
                     goto structural;
                 }
-                if (raw_partial_lit_min(raw, raw_len, dt->pos, dt->syn->param_end, 2)) {
-                    dt->decode = DSML_DECODE_STRUCTURAL;
+                if (raw_partial_lit(raw, raw_len, dt->pos, dt->syn->param_end)) {
+                    /* Keep even a lone '<' for the next update, without
+                     * making ordinary code/HTML switch to greedy sampling. */
+                    dt->decode = raw_len - dt->pos >= 2 ?
+                        DSML_DECODE_STRUCTURAL : DSML_DECODE_STRING_BODY;
                     return;
                 }
                 dt->pos++;
@@ -6774,8 +6769,9 @@ static void dsml_decode_tracker_update(dsml_decode_tracker *dt,
                         dt->decode = DSML_DECODE_STRUCTURAL;
                         goto structural;
                     }
-                    if (raw_partial_lit_min(raw, raw_len, dt->pos, dt->syn->param_end, 2)) {
-                        dt->decode = DSML_DECODE_STRUCTURAL;
+                    if (raw_partial_lit(raw, raw_len, dt->pos, dt->syn->param_end)) {
+                        dt->decode = raw_len - dt->pos >= 2 ?
+                            DSML_DECODE_STRUCTURAL : DSML_DECODE_JSON_STRUCTURAL;
                         return;
                     }
                 }
@@ -17551,6 +17547,34 @@ static void test_tool_memory_max_ids_prunes_oldest(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+static void test_decode_tracker_split_parameter_close(void) {
+    for (size_t style = 0; style < sizeof(dsml_syntaxes) / sizeof(dsml_syntaxes[0]); style++) {
+        const dsml_syntax *syn = &dsml_syntaxes[style];
+        for (int string_value = 0; string_value <= 1; string_value++) {
+            buf raw = {0};
+            buf_printf(&raw, "%s%s name=\"bash\">%s name=\"command\" string=\"%s\">%s%s%s%s",
+                       syn->tool_calls_start, syn->invoke_start, syn->param_start,
+                       string_value ? "true" : "false",
+                       string_value ? "echo <x>" : "{\"x\":\"a\\\"b\"}",
+                       syn->param_end, syn->invoke_end, syn->tool_calls_end);
+            dsml_decode_tracker tracker;
+            dsml_decode_tracker_init(&tracker);
+            for (size_t n = 1; n <= raw.len; n++) {
+                dsml_decode_tracker_update(&tracker, raw.ptr, n);
+                dsml_decode_state expected = dsml_decode_state_for_text(raw.ptr, n);
+                if (tracker.decode != expected) {
+                    fprintf(stderr, "split tool marker: style=%zu string=%d byte=%zu actual=%d expected=%d\n",
+                            style, string_value, n, tracker.decode, expected);
+                    TEST_ASSERT(tracker.decode == expected);
+                    break;
+                }
+            }
+            TEST_ASSERT(tracker.decode == DSML_DECODE_OUTSIDE);
+            buf_free(&raw);
+        }
+    }
+}
+
 static void test_tool_separator_whitespace_is_not_content(void) {
     const char *generated =
         "<think>need a tool</think>"
@@ -19479,6 +19503,7 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_visible_suffix_matches_client_replay();
     test_exact_dsml_tool_replay_can_be_disabled();
     test_dsml_decode_state_separates_structure_and_payload();
+    test_decode_tracker_split_parameter_close();
     test_tool_memory_max_ids_prunes_oldest();
     test_kv_tool_map_filters_by_dsml_text();
     test_kv_tool_map_restores_before_prompt_render();
