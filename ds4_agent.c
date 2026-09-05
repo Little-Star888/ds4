@@ -8530,16 +8530,18 @@ static bool agent_tool_observation_build(agent_worker *w,
     return true;
 }
 
-static bool agent_tool_observation_fits(agent_worker *w,
+/* -1 is a rendering/embedding error, not a request to compact the context. */
+static int agent_tool_observation_fits(agent_worker *w,
                                         const agent_tool_observation *obs,
                                         int reserve_tokens,
-                                        int *tokens_out) {
+                                        int *tokens_out,
+                                        char *err, size_t err_len) {
     ds4_tokens tmp = {0};
     ds4_vision_span *spans = NULL;
-    char err[160] = {0};
+    if (err_len) err[0] = '\0';
     if (!agent_tool_observation_build(w, obs, &tmp, &spans,
-                                      err, sizeof(err)))
-        return false;
+                                      err, err_len))
+        return -1;
     int tokens = tmp.len;
     ds4_tokens_free(&tmp);
     agent_vision_spans_free(spans, obs->image_count);
@@ -9432,8 +9434,11 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         }
         int projected_tokens = 0;
         int result_reserve = agent_tool_result_reserve_tokens(w);
-        if (!agent_tool_observation_fits(w, &observation, result_reserve,
-                                         &projected_tokens))
+        char append_err[160] = {0};
+        int fits = agent_tool_observation_fits(w, &observation, result_reserve,
+                                               &projected_tokens, append_err, sizeof(append_err));
+        if (fits < 0) goto observation_error;
+        if (!fits)
         {
             if (!agent_worker_compact(w, "tool result would exceed context",
                                       compact_err, sizeof(compact_err)))
@@ -9448,8 +9453,10 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 agent_set_error(w, compact_err[0] ? compact_err : "context compaction failed");
                 return 1;
             }
-            if (!agent_tool_observation_fits(w, &observation, result_reserve,
-                                             &projected_tokens))
+            fits = agent_tool_observation_fits(w, &observation, result_reserve,
+                                                &projected_tokens, append_err, sizeof(append_err));
+            if (fits < 0) goto observation_error;
+            if (!fits)
             {
                 agent_tool_observation_free(&observation);
                 agent_tool_observation_init(&observation);
@@ -9461,7 +9468,10 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                          projected_tokens, agent_worker_effective_ctx_size(w),
                          result_reserve);
                 agent_tool_observation_puts(&observation, msg);
-                if (!agent_tool_observation_fits(w, &observation, 16, NULL)) {
+                fits = agent_tool_observation_fits(w, &observation, 16, NULL,
+                                                   append_err, sizeof(append_err));
+                if (fits < 0) goto observation_error;
+                if (!fits) {
                     agent_tool_observation_free(&observation);
                     agent_dsml_parser_free(&dsml);
                     agent_set_error(w, "context full after compaction");
@@ -9469,15 +9479,9 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 }
             }
         }
-        char append_err[160] = {0};
         if (!agent_tool_observation_commit(w, &observation,
-                                           append_err, sizeof(append_err))) {
-            agent_tool_observation_free(&observation);
-            agent_dsml_parser_free(&dsml);
-            agent_set_error(w, append_err[0] ? append_err :
-                            "unable to append tool observation");
-            return 1;
-        }
+                                           append_err, sizeof(append_err)))
+            goto observation_error;
         agent_tool_observation_free(&observation);
         agent_dsml_parser_free(&dsml);
 
@@ -9492,6 +9496,13 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             pthread_mutex_unlock(&w->mu);
         }
         free(queued_user);
+        continue;
+
+observation_error:
+        agent_tool_observation_free(&observation);
+        agent_dsml_parser_free(&dsml);
+        agent_set_error(w, append_err[0] ? append_err : "unable to append tool observation");
+        return 1;
     }
 }
 
