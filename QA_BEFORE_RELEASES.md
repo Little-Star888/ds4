@@ -1000,6 +1000,19 @@ clients.
   decoding should retain already-verified greedy drafts across that change.
   Check tool-result continuation through all three API formats. Responses
   requires full input replay, not an unsupported `previous_response_id`.
+- Exercise actual `ds4-server` coding sessions, not only direct ds4-agent or
+  isolated HTTP requests. Use Pi, OpenCode or another supported coding client
+  for several read/edit/build/test rounds, including a harmless tool failure
+  and recovery. Grow the conversation past 4K tokens and continue it.
+  Capture `--trace` and check tool IDs, raw tool replay, rendered prompts,
+  cache source, matched-prefix length and continued-prefill size after each
+  tool result. An unchanged history should retain its reusable prefix;
+  investigate repeated full prefills or unexplained canonicalization rebuilds.
+  Conversely, editing an earlier message must invalidate the changed suffix.
+  Compare a continued request with a fresh replay of the same full history,
+  checking tool arguments, coherent output and context isolation. Record any
+  necessary rebuild and its latency rather than counting a working tool alone
+  as proof that prefix matching works.
 - Test SSE streaming with thinking enabled and disabled.
 - Test keepalive during long prefill and confirm clients do not time out.
 - In batched mode, close clients while their requests are queued, prefilling,
