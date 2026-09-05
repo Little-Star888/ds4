@@ -14681,10 +14681,12 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
               CUDA_DERIVED_Q8_0_ALIGNED_DENSE,
               in_dim, out_dim, 1u, aligned_bytes)
         : NULL;
-    if (aligned && n_tok == 1u) {
+    if (aligned && (n_tok == 1u ||
+                    (n_tok <= 8u && ds4_gpu_device_is_spark() &&
+                     !g_q8_dequant_gemm_enabled))) {
         const int rc = ds4_mmq_q8_0_aligned_dense_vec(
             aligned, (const float *)x->ptr, (float *)out->ptr,
-            (int)out_dim, 1, (int)in_dim, cuda_decode_stream());
+            (int)out_dim, (int)n_tok, (int)in_dim, cuda_decode_stream());
         if (rc == 0) return 1;
     }
     if (aligned && n_tok >= 512u && out_dim >= 2048u &&
