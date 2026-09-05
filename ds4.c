@@ -64285,11 +64285,22 @@ int ds4_chat_append_multimodal_message(
     }
     const bool tool = !strcmp(role, "tool") || !strcmp(role, "function");
     const bool user = !strcmp(role, "user");
-    if ((DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA &&
-         e->vision_kind != DS4_VISION_DEEPSEEK4) || (!tool && !user)) {
+    if (!tool && !user) {
         if (error && error_cap)
             snprintf(error, error_cap,
                      "multimodal messages require a supported user or tool role");
+        return 0;
+    }
+    /* Text-only tool results do not require vision support and must retain
+     * the model's normal wrapper and payload escaping. */
+    if (image_count == 0) {
+        ds4_chat_append_message(e, tokens, role, text_parts[0]);
+        return 1;
+    }
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA &&
+        e->vision_kind != DS4_VISION_DEEPSEEK4) {
+        if (error && error_cap)
+            snprintf(error, error_cap, "model does not support image messages");
         return 0;
     }
     for (size_t i = 0; i < image_count; i++) {
