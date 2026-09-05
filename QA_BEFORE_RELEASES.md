@@ -979,6 +979,27 @@ clients.
 - `GET /v1/models/deepseek-v4-flash` and `GET /v1/models/deepseek-v4-pro`
   should both serve whichever GGUF is loaded.
 - Test OpenAI chat completion, OpenAI Responses, and Anthropic messages.
+- After tool-parser changes, run `make test-frontends` and
+  `make test-session-state`. These targets do not load model weights. Repeat
+  the frontend suites with ASan/UBSan for parser and buffer changes.
+- Test both DeepSeek DSML and GLM tool syntax. Split closing delimiters at
+  every byte boundary; sampled argument text must not become greedy syntax
+  merely because a token ends in `<`. Literal thinking/tool markers inside
+  arguments must not end the call. Check ordinary HTML entities, literal
+  closing-wrapper escapes, and repeated escape spellings through rendering,
+  parsing, streaming and canonical history replay.
+- Truncate a tool argument using a small output budget and an explicit client
+  stop, with and without streaming. Preserve `length` versus `stop`, never
+  invent a complete action from an unfinished argument, and do not retry after
+  a client stop. Model-error recovery must share the original output budget;
+  usage includes the failed attempt. Partial SSE arguments may remain partial.
+- Run a real Pi or other coding-client read/write/edit/build/test loop with
+  GLM MTP and matching DeepSeek DSpark, in default and exact-sampling modes.
+  Discard unseen speculative suffixes after tool/stop markers. Exact sampling
+  must resample when the parser changes sampling mode; default opportunistic
+  decoding should retain already-verified greedy drafts across that change.
+  Check tool-result continuation through all three API formats. Responses
+  requires full input replay, not an unsupported `previous_response_id`.
 - Test SSE streaming with thinking enabled and disabled.
 - Test keepalive during long prefill and confirm clients do not time out.
 - In batched mode, close clients while their requests are queued, prefilling,
@@ -997,6 +1018,27 @@ clients.
   2048-token prefill cap; a silent fallback to 4096 is an OOM regression.
 - Test `--trace` and confirm rendered prompts, cache decisions, generated text,
   and tool-parser events are useful without leaking unrelated state.
+
+September 6 focused tool-call QA passed with resident Flash 0731 Q2 + DSpark
+and GLM 5.3 Flash Q2 + MTP on the GB10 Spark, using 8K contexts. Pi completed
+read/write/edit/build/test loops in default and exact-sampling modes for both
+models. Direct ds4-agent tasks also passed, preserving literal HTML entities
+through file creation and editing. Independent 1,650-case clamp checks passed
+for each generated program. OpenAI streaming/nonstreaming, Anthropic and
+Responses tool-result continuations passed; output-limit and client-stop
+cases returned no fabricated complete call. Disconnected tool streams were
+followed by valid replies in under a second. Metal and CUDA frontend builds
+were warning-free; model-free frontend, CPU ASan/UBSan, session-state and TP
+command tests passed.
+
+This is not full-model or full-backend release sign-off. The reported full
+GLM 5.3 Q4 failure on a 512 GB Ultra was not reproduced with its exact weights,
+prompt and request settings. Capture raw output, source revision, output
+budget and stop reason before attributing `unterminated tool call` to inference
+quality or memory. Adversarial live prompts asking both models to copy literal
+thinking/tool-end tags were not copied faithfully: traces showed the models
+changed the text before parsing. Deterministic parser/stream tests preserve
+those markers, but that does not establish model-level copying accuracy.
 
 ## 13. ds4-agent
 
@@ -1039,6 +1081,8 @@ The agent is the most stateful component.  Test it manually, not only by build.
   for Flash, PRO and GLM, including closing-wrapper escaping. They must not
   require a vision model. A rejection here once masqueraded as context
   exhaustion after even a tiny shell result; increasing context cannot fix it.
+  Rendering/image-observation errors must be reported directly without
+  compacting the conversation as though it had run out of context.
 - Bash tools:
   test short output, large output truncation, non-zero exit output, long-running
   jobs, `bash_status`, and `bash_stop`.
