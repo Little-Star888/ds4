@@ -5864,8 +5864,9 @@ static DS4_SERVER_MAYBE_UNUSED bool parse_generated_message_ex(
 
 /* Try to repair a truncated DSML block.
  *
- * DSML nesting order is: tool_calls > invoke > parameter.
- * Single-pass scan: count opens vs closes, then append missing closing tags.
+ * Only the outer wrapper may be missing. An unfinished invocation can still
+ * be missing arguments; an unfinished value can be a truncated shell command
+ * or file body. Closing either would invent an executable action.
  *
  * Returns true if repair was applied, false if the text had no recognizable DSML
  * or was already balanced.  This deliberately does not rewrite malformed but
@@ -5912,16 +5913,15 @@ static bool try_repair_dsml(const char *s, size_t len, buf *out) {
         else if ((d = strlen(pe)) && !strncmp(p, pe, d)) { poe++; p += d; }
         else p++;
     }
-    if (tos == toe && ios == ioe && pos == poe) return false;
+    if (ios != ioe || pos != poe) return false;
+    if (tos == toe) return false;
     if (toe > tos || ioe > ios || poe > pos) {
         /* Extra closing tags are not a truncation pattern.  Refuse repair so the
          * unsigned differences below cannot wrap and append a huge suffix. */
         return false;
     }
-    /* Repair: copy original text and append missing closing tags in reverse order */
+    /* All invocations are complete; supply only the enclosing wrapper. */
     buf_puts(out, s);
-    for (size_t i = 0; i < pos - poe; i++) buf_puts(out, pe);
-    for (size_t i = 0; i < ios - ioe; i++) buf_puts(out, ie);
     for (size_t i = 0; i < tos - toe; i++) buf_puts(out, te);
     return true;
 }
@@ -12460,6 +12460,8 @@ decode_again:
     int next_decode_log = 50;
     if (max_tokens < 0) max_tokens = 0;
     if (max_tokens > room) max_tokens = room;
+    const char *stop_detail = max_tokens == room ? "context limit" : "output limit";
+    int stop_token = -1;
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
     const double decode_t0 = now_sec();
     double last_decode_log_t = decode_t0;
@@ -12517,6 +12519,8 @@ decode_again:
                                              token,
                                              j->req.think_mode)) {
             finish = "stop";
+            stop_detail = "stop token";
+            stop_token = token;
             break;
         }
 
@@ -12572,6 +12576,8 @@ decode_again:
                                                  token,
                                                  j->req.think_mode)) {
                 finish = "stop";
+                stop_detail = "stop token";
+                stop_token = token;
                 stop_decode = true;
                 break;
             }
@@ -12747,6 +12753,7 @@ decode_again:
             if (hit_stop) {
                 (void)stop_len;
                 finish = "stop";
+                stop_detail = "client stop sequence";
                 text.len = stop_pos;
                 text.ptr[text.len] = '\0';
                 pthread_mutex_lock(&s->inference_mu);
@@ -12806,6 +12813,17 @@ decode_again:
 
     if (j->req.kind == REQ_CHAT && j->req.has_tools &&
         saw_tool_start && !saw_tool_end && strcmp(finish, "error") != 0)
+    {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: incomplete %s tool call: stop=%s token=%d generated=%d limit=%d room=%d",
+                   j->req.model_syntax == SERVER_MODEL_SYNTAX_GLM ? "GLM" : "DeepSeek",
+                   stop_detail, stop_token, completion, max_tokens, room);
+        trace_event(s, trace_id, "incomplete tool call: stop=%s token=%d generated=%d limit=%d room=%d",
+                    stop_detail, stop_token, completion, max_tokens, room);
+    }
+    if (j->req.kind == REQ_CHAT && j->req.has_tools &&
+        saw_tool_start && !saw_tool_end && strcmp(finish, "error") != 0 &&
+        strcmp(finish, "length") != 0)
     {
         /* Deterministically complete a simple truncation.  Anything more than
          * missing closing tags stays model-owned: for non-streaming requests,
@@ -12876,7 +12894,8 @@ decode_again:
                          recovery_err[0] ? recovery_err : "unknown error");
             } else {
                 finish = "error";
-                snprintf(err, sizeof(err), "unterminated tool call");
+                snprintf(err, sizeof(err), "unterminated tool call (%s; token=%d, generated=%d, limit=%d)",
+                         stop_detail, stop_token, completion, max_tokens);
             }
         }
         buf_free(&repaired);
@@ -12937,7 +12956,8 @@ decode_again:
              * Semantic repair is intentionally avoided: if the parser cannot
              * execute the block, feed the model a tool error and the protocol
              * reminder so it owns the corrected next action. */
-            if (!j->req.stream && !dsml_recovery_attempted) {
+            if (!j->req.stream && !dsml_recovery_attempted &&
+                strcmp(final_finish, "length") != 0) {
                 int recovery_tokens = 0;
                 char recovery_err[160] = {0};
                 const char *detail = err[0] ? err : "invalid tool call";
@@ -16459,10 +16479,8 @@ static void test_dsml_parser_recovers_loose_nested_parameters(void) {
     tool_calls_free(&calls);
 }
 
-/* Verify that try_repair_dsml + parse_generated_message produces structurally
-   valid tool calls for all three DSML styles and multiple truncation scenarios.
-   Balanced but malformed DSML is not repaired: the model must retry it.
-   This tests repair ACCURACY, not just that it doesn't crash. */
+/* Repair only a missing wrapper around complete invocations. Never turn an
+ * incomplete command, file body or argument list into an executable call. */
 static void test_dsml_repair_produces_parseable_calls(void) {
     char *content = NULL;
     char *reasoning = NULL;
@@ -16488,7 +16506,7 @@ static void test_dsml_repair_produces_parseable_calls(void) {
         free(content); free(reasoning); tool_calls_free(&calls);
     }
 
-    /* === TEST 2: Full DSML - missing </invoke> and </tool_calls> === */
+    /* Missing </invoke>: even a closed value may have further arguments. */
     {
         const char *broken =
             "\n\n"
@@ -16498,15 +16516,11 @@ static void test_dsml_repair_produces_parseable_calls(void) {
         /* Missing: DS4_INVOKE_END, DS4_TOOL_CALLS_END */
 
         buf_free(&repaired);
-        TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
-        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, &content, &reasoning, &calls));
-        TEST_ASSERT(calls.len == 1);
-        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "edit"));
-        TEST_ASSERT(strstr(calls.v[0].arguments, "\"path\": \"/tmp/test.c\"") != NULL);
-        free(content); free(reasoning); tool_calls_free(&calls);
+        TEST_ASSERT(!try_repair_dsml(broken, strlen(broken), &repaired));
+        TEST_ASSERT(repaired.len == 0);
     }
 
-    /* === TEST 3: Full DSML - missing </parameter> === */
+    /* A command prefix is not a complete command, even if it looks plausible. */
     {
         const char *broken =
             "\n\n"
@@ -16516,12 +16530,8 @@ static void test_dsml_repair_produces_parseable_calls(void) {
         /* Missing: DS4_PARAM_END, DS4_INVOKE_END, DS4_TOOL_CALLS_END */
 
         buf_free(&repaired);
-        TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
-        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, &content, &reasoning, &calls));
-        TEST_ASSERT(calls.len == 1);
-        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
-        TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"echo hello\"") != NULL);
-        free(content); free(reasoning); tool_calls_free(&calls);
+        TEST_ASSERT(!try_repair_dsml(broken, strlen(broken), &repaired));
+        TEST_ASSERT(repaired.len == 0);
     }
 
     /* === TEST 4: Short DSML - missing closing tags === */
