@@ -24156,7 +24156,9 @@ static int routed_moe_launch(
             const cudaStream_t aligned_stream =
                 n_tokens == 1u ? cuda_decode_stream() : (cudaStream_t)0;
             int rc;
-            if (n_tokens == 1u) {
+            if (n_tokens == 1u ||
+                (n_tokens <= 8u && ds4_gpu_device_is_spark() &&
+                 !g_q8_dequant_gemm_enabled && expert_in_dim % 1024u == 0)) {
                 rc = ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
                     gate_aligned, up_aligned,
                     (const float *)x->ptr,
