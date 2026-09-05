@@ -6553,7 +6553,7 @@ static bool test_mtp_capture_speculative(ds4_engine *engine, const ds4_tokens *p
     *out_len = 0;
     *max_chunk = 0;
     ds4_session *session = NULL;
-    TEST_ASSERT(ds4_session_create(&session, engine, 32768) == 0);
+    TEST_ASSERT(ds4_session_create(&session, engine, prompt->len + max_tokens + 16) == 0);
     if (!session) return false;
 
     char err[160];
@@ -6595,7 +6595,7 @@ static bool test_mtp_worst_argmax_gap(ds4_engine *engine, const ds4_tokens *prom
     *worst_gap = 0.0f;
     *worst_at = -1;
     ds4_session *session = NULL;
-    TEST_ASSERT(ds4_session_create(&session, engine, 32768) == 0);
+    TEST_ASSERT(ds4_session_create(&session, engine, prompt->len + n + 16) == 0);
     if (!session) return false;
 
     char err[160];
@@ -6661,6 +6661,7 @@ static ds4_engine *test_open_dspark_engine(const char *support_path) {
         .backend = DS4_BACKEND_CUDA,
 #endif
         .quality = false,
+        .prefill_chunk = 512,
         .ssd_streaming = test_env_bool("DS4_TEST_SSD_STREAMING"),
         .ssd_streaming_cold = test_env_bool("DS4_TEST_SSD_STREAMING_COLD"),
         .ssd_streaming_cache_experts =

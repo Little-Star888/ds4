@@ -2584,7 +2584,8 @@ static void print_size(uint64_t bytes) {
 #define DS4_DSPARK_MAX_TARGET_LAYERS 8
 #define DS4_DSPARK_MAX_STAGES 8
 #define DS4_DSPARK_MAX_BLOCK_SIZE 16
-#ifdef __APPLE__
+#if defined(__APPLE__) || (!defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU))
+/* Seed plus five drafts needs five intermediate compressor frontiers. */
 #define DS4_SPEC_PREFIX_SLOTS 5
 #else
 #define DS4_SPEC_PREFIX_SLOTS 4
@@ -75183,8 +75184,9 @@ int ds4_session_prefill_cap(ds4_session *s) {
  * raw attention window can hide a stale speculative prefix. */
 bool ds4_test_dspark_prefix_capture(ds4_engine *engine, const ds4_tokens *prompt) {
     ds4_session *ref = NULL, *spec = NULL;
-    bool ok = ds4_session_create(&ref, engine, 32768) == 0 &&
-              ds4_session_create(&spec, engine, 32768) == 0;
+    const int ctx = prompt->len + 16;
+    bool ok = ds4_session_create(&ref, engine, ctx) == 0 &&
+              ds4_session_create(&spec, engine, ctx) == 0;
     int tokens[6], tops[6];
     uint32_t counts[6][DS4_MAX_LAYER], index_counts[6][DS4_MAX_LAYER];
     char err[160];
