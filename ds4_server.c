@@ -11378,6 +11378,12 @@ static bool continue_after_invalid_dsml(server *s, server_slot *slot,
     return ok;
 }
 
+static int server_decode_budget(int requested, int generated, int room) {
+    if (requested <= generated || room <= 0) return 0;
+    int remaining = requested - generated;
+    return remaining < room ? remaining : room;
+}
+
 static bool should_remember_thinking_checkpoint(const request *r,
                                                 const thinking_state *thinking,
                                                 const char *finish) {
@@ -12459,6 +12465,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     }
 
     bool dsml_recovery_attempted = false;
+    int recovery_completion = 0;
     uint64_t rng = j->req.seed;
     if (!rng && !random_bytes(&rng, sizeof(rng))) {
         rng = ((uint64_t)time(NULL) << 32) ^ (uint64_t)(uintptr_t)j;
@@ -12471,16 +12478,16 @@ decode_again:
     size_t stop_scan_from = 0;
     const char *finish = "length";
     int completion = 0;
-    int max_tokens = j->req.max_tokens;
     int room = ds4_session_ctx(slot->session) - ds4_session_pos(slot->session);
+    int max_tokens = server_decode_budget(j->req.max_tokens,
+                                          recovery_completion, room);
     bool saw_tool_start = false;
     bool saw_tool_end = false;
     bool saw_orphan_tool_end = false;
+    bool client_stop = false;
     size_t tool_scan_from = 0;
     int next_tool_progress = 128;
     int next_decode_log = 50;
-    if (max_tokens < 0) max_tokens = 0;
-    if (max_tokens > room) max_tokens = room;
     const char *stop_detail = max_tokens == room ? "context limit" : "output limit";
     int stop_token = -1;
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
@@ -12776,6 +12783,7 @@ decode_again:
                 (void)stop_len;
                 finish = "stop";
                 stop_detail = "client stop sequence";
+                client_stop = true;
                 text.len = stop_pos;
                 text.ptr[text.len] = '\0';
                 pthread_mutex_lock(&s->inference_mu);
@@ -12848,12 +12856,11 @@ decode_again:
     }
     if (j->req.kind == REQ_CHAT && j->req.has_tools &&
         saw_tool_start && !saw_tool_end && strcmp(finish, "error") != 0 &&
-        strcmp(finish, "length") != 0)
+        strcmp(finish, "length") != 0 && !client_stop)
     {
-        /* Deterministically complete a simple truncation.  Anything more than
-         * missing closing tags stays model-owned: for non-streaming requests,
-         * append a tool error plus prompt reminder to the live session and let
-         * the model issue a fresh call. */
+        /* Only repair a missing outer wrapper around complete invocations.
+         * Otherwise let the model issue a fresh call within the same output
+         * budget, after a tool error and prompt reminder. */
         bool completed_truncation = false;
         buf repaired = {0};
         if (try_repair_dsml(text.ptr, text.len, &repaired)) {
@@ -12884,7 +12891,7 @@ decode_again:
             tool_calls_free(&test_calls);
         }
         if (!completed_truncation) {
-            if (!j->req.stream && !dsml_recovery_attempted) {
+            if (!j->req.stream && !dsml_recovery_attempted && completion < max_tokens) {
                 int recovery_tokens = 0;
                 char recovery_err[160] = {0};
                 server_log(DS4_LOG_WARNING,
@@ -12901,6 +12908,7 @@ decode_again:
                                                 sizeof(recovery_err)))
                 {
                     dsml_recovery_attempted = true;
+                    recovery_completion += completion;
                     server_log(DS4_LOG_GENERATION,
                                "ds4-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
                                ctx_span,
@@ -12982,7 +12990,8 @@ decode_again:
              * execute the block, feed the model a tool error and the protocol
              * reminder so it owns the corrected next action. */
             if (!j->req.stream && !dsml_recovery_attempted &&
-                strcmp(final_finish, "length") != 0) {
+                strcmp(final_finish, "length") != 0 && !client_stop &&
+                completion < max_tokens) {
                 int recovery_tokens = 0;
                 char recovery_err[160] = {0};
                 const char *detail = err[0] ? err : "invalid tool call";
@@ -13000,6 +13009,7 @@ decode_again:
                                                 sizeof(recovery_err)))
                 {
                     dsml_recovery_attempted = true;
+                    recovery_completion += completion;
                     server_log(DS4_LOG_GENERATION,
                                "ds4-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
                                ctx_span,
@@ -13022,17 +13032,7 @@ decode_again:
             if (!parsed_ok) {
                 /* Print raw DSML snippet for debugging */
                 size_t dsml_snippet_len = 0;
-                const char *dsml_start = NULL;
-                const char *p;
-                for (p = text.ptr; p && (size_t)(p - text.ptr) < text.len - 20; p++) {
-                    if ((strncmp(p, DS4_TOOL_CALLS_START, strlen(DS4_TOOL_CALLS_START)) == 0) ||
-                        (strncmp(p, DS4_TOOL_CALLS_START_SHORT, strlen(DS4_TOOL_CALLS_START_SHORT)) == 0) ||
-                        (strncmp(p, "<tool_calls>", 12) == 0) ||
-                        (strncmp(p, "<tool_call>", 11) == 0)) {
-                        dsml_start = p;
-                        break;
-                    }
-                }
+                const char *dsml_start = find_any_tool_start(text.ptr ? text.ptr : "");
                 if (dsml_start) {
                     dsml_snippet_len = text.len - (dsml_start - text.ptr);
                     if (dsml_snippet_len > 500) dsml_snippet_len = 500;
@@ -13102,6 +13102,7 @@ decode_again:
     log_tool_calls_summary(ctx_span, &parsed_calls,
                            responses_protocol);
 
+    completion += recovery_completion;
     trace_finish(s, trace_id, &j->req, final_finish, completion,
                  saw_tool_start, saw_tool_end,
                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
@@ -16780,6 +16781,50 @@ static void test_invalid_glm_tool_error_suffix(void) {
     request_free(&r);
 }
 
+static void test_tool_recovery_output_budget(void) {
+    TEST_ASSERT(server_decode_budget(24, 0, 100) == 24);
+    TEST_ASSERT(server_decode_budget(24, 17, 100) == 7);
+    TEST_ASSERT(server_decode_budget(24, 17, 3) == 3);
+    TEST_ASSERT(server_decode_budget(24, 24, 100) == 0);
+    TEST_ASSERT(server_decode_budget(24, 25, 100) == 0);
+    TEST_ASSERT(server_decode_budget(24, 0, 0) == 0);
+    TEST_ASSERT(server_decode_budget(24, 0, -1) == 0);
+    TEST_ASSERT(server_decode_budget(-1, 0, 100) == 0);
+    TEST_ASSERT(server_decode_budget(INT_MAX, INT_MAX - 1, INT_MAX) == 1);
+    /* Logging malformed, short tool output must not subtract from its length. */
+    TEST_ASSERT(find_any_tool_start("<tool_call>") != NULL);
+    TEST_ASSERT(find_any_tool_start("<tool_call") == NULL);
+    TEST_ASSERT(find_any_tool_start("") == NULL);
+}
+
+static void test_incomplete_tool_call_keeps_stop_reason(void) {
+    const char *raw[] = {
+        DS4_TOOL_CALLS_START DS4_INVOKE_START " name=\"write\">"
+        DS4_PARAM_START " name=\"content\" string=\"true\">unfinished",
+        "<tool_call>write<arg_key>content</arg_key><arg_value>unfinished",
+    };
+    const char *reasons[] = {"length", "stop"};
+    for (int glm = 0; glm <= 1; glm++) {
+        for (int i = 0; i < 2; i++) {
+            const char *finish = reasons[i];
+            char *content = NULL, *reasoning = NULL;
+            char err[128] = {0};
+            tool_calls calls = {0};
+            bool recovered = false;
+            TEST_ASSERT(!parse_generated_message_for_response_for_syntax(
+                glm ? SERVER_MODEL_SYNTAX_GLM : SERVER_MODEL_SYNTAX_DEEPSEEK,
+                raw[glm], true, true, false, &finish, err, sizeof(err),
+                &content, &reasoning, &calls, &recovered));
+            TEST_ASSERT(!strcmp(finish, reasons[i]));
+            TEST_ASSERT(recovered && calls.len == 0);
+            TEST_ASSERT(content && !strcmp(content, raw[glm]));
+            free(content);
+            free(reasoning);
+            tool_calls_free(&calls);
+        }
+    }
+}
+
 static void test_thinking_dsml_is_not_executable_before_think_close(void) {
     const char *generated =
         "<think>I might mention a malformed or tentative tool call here:\n\n"
@@ -19755,6 +19800,8 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_parse_failure_returns_recoverable_finish();
     test_invalid_dsml_tool_error_suffix_includes_system_prompt();
     test_invalid_glm_tool_error_suffix();
+    test_tool_recovery_output_budget();
+    test_incomplete_tool_call_keeps_stop_reason();
     test_thinking_dsml_is_not_executable_before_think_close();
     test_thinking_dsml_after_think_close_is_executable();
     test_tool_checkpoint_suffix_is_future_prompt_canonical();
