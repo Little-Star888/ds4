@@ -54320,6 +54320,14 @@ static bool ds4_session_dspark_seed_batch_enabled(
     if (!s || !s->engine) return false;
     const ds4_engine *e = s->engine;
     const ds4_layer_weights *layer = &e->weights.layer[DS4_N_LEADING_DENSE];
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (e->backend == DS4_BACKEND_CUDA && ds4_gpu_device_is_spark()) {
+        return !e->ssd_streaming && !e->dspark_exact_sampling &&
+               layer->ffn_gate_exps && layer->ffn_down_exps &&
+               layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+               layer->ffn_down_exps->type == DS4_TENSOR_Q2_K;
+    }
+#endif
     /* Keep streaming and unmeasured weight/device combinations on their
      * existing schedule. No sampling decision is changed by this dispatch. */
     return e->backend == DS4_BACKEND_METAL && !e->ssd_streaming &&
@@ -54330,6 +54338,16 @@ static bool ds4_session_dspark_seed_batch_enabled(
              layer->ffn_down_exps->type == DS4_TENSOR_Q2_K) ||
             (e->tp.active && layer->ffn_gate_exps->type == DS4_TENSOR_MXFP4 &&
              layer->ffn_down_exps->type == DS4_TENSOR_MXFP4));
+}
+
+static bool ds4_session_dspark_seed_batch_short_fallback(const ds4_session *s) {
+    if (s->engine->backend == DS4_BACKEND_METAL) return true;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    return s->engine->backend == DS4_BACKEND_CUDA &&
+           ds4_gpu_device_is_spark();
+#else
+    return false;
+#endif
 }
 
 static bool ds4_dspark_scheduler_enabled(const ds4_session *s) {
@@ -54347,10 +54365,17 @@ static uint32_t ds4_dspark_scheduler_window(const ds4_session *s) {
 }
 
 static uint32_t ds4_dspark_scheduler_skip_cycles(const ds4_session *s) {
-    const uint32_t fallback =
-        s && s->engine->backend == DS4_BACKEND_METAL &&
+    uint32_t fallback =
+        s && ds4_session_dspark_seed_batch_short_fallback(s) &&
         ds4_session_dspark_seed_batch_enabled(s) ? 32u :
         ds4_dspark_rocm_gfx1151_fast_path() ? 4u : 2u;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* Recheck sooner after useful long drafts; low-acceptance prose keeps
+     * the longer pause instead of paying for another unproductive proposal. */
+    if (s && s->dspark_sched_long_accept_seen &&
+        ds4_session_dspark_seed_batch_enabled(s) && ds4_gpu_device_is_spark())
+        fallback = 8u;
+#endif
     return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_SKIP", fallback);
 }
 
@@ -70230,9 +70255,10 @@ static int ds4_session_eval_dspark_speculative_argmax(
         size_t       errlen) {
     /* n_accept == 0 means the already-chosen seed is inside this batch. */
     const int seed_tokens = n_accept == 0 ? 1 : 0;
-    /* Preserve the separately tuned CUDA/ROCm scheduling policy. */
+    /* A seed was already selected by the target; it is not a draft success.
+     * Preserve the separately tuned ROCm policy. */
     const int scheduler_seed_tokens =
-        s && s->engine->backend == DS4_BACKEND_METAL ? seed_tokens : 0;
+        s && ds4_session_dspark_seed_batch_short_fallback(s) ? seed_tokens : 0;
     const bool spec_log = getenv("DS4_DSPARK_SPEC_LOG") != NULL;
     const bool stats_enabled = s && ds4_dspark_stats_enabled();
     const bool scheduler_enabled = s && ds4_dspark_scheduler_enabled(s);
@@ -74260,7 +74286,8 @@ static int ds4_session_eval_speculative_argmax_impl(
             /* A short, low-confidence suffix rarely repays a batched seed.
              * Decode the seed once, then check the already-prepared first
              * draft against its logits without running another proposal. */
-            if (e->backend == DS4_BACKEND_METAL && s->dspark_draft_len < 3) {
+            if (ds4_session_dspark_seed_batch_short_fallback(s) &&
+                s->dspark_draft_len < 3) {
                 if (ds4_session_eval_probe_tp(s, first_token, false, err, errlen) != 0)
                     return -1;
                 accepted[0] = first_token;
@@ -74281,7 +74308,7 @@ static int ds4_session_eval_speculative_argmax_impl(
                     accepted, accepted_cap, err, errlen);
             if (fused_n != 0) return fused_n;
         }
-        if (e->backend == DS4_BACKEND_METAL) {
+        if (ds4_session_dspark_seed_batch_short_fallback(s)) {
             /* A declined proposal already consumed this cycle's confidence and
              * scheduler decision. Do not draft the same seed again after decode. */
             if (ds4_session_eval_probe_tp(s, first_token, false, err, errlen) != 0)
