@@ -6522,6 +6522,11 @@ static const dsml_syntax dsml_syntaxes[] = {
     },
 };
 
+static const dsml_syntax glm_tool_syntax = {
+    "<tool_call>", "</tool_call>",
+    "<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>",
+};
+
 typedef struct {
     dsml_track_mode mode;
     dsml_decode_state decode;
@@ -6529,6 +6534,7 @@ typedef struct {
     size_t pos;
     bool json_in_string;
     bool json_escaped;
+    server_model_syntax model_syntax;
 } dsml_decode_tracker;
 
 static size_t dsml_max_tool_start_len(void) {
@@ -6727,7 +6733,19 @@ static void dsml_decode_tracker_update(dsml_decode_tracker *dt,
         if (dt->mode == DSML_TRACK_SEARCH) {
             size_t pos = 0;
             const dsml_syntax *syn = NULL;
-            if (!dsml_find_tool_start_from(raw, raw_len, dt->pos, &pos, &syn)) {
+            bool found;
+            if (dt->model_syntax == SERVER_MODEL_SYNTAX_GLM) {
+                const char *start = find_lit_bounded(raw + dt->pos,
+                    raw_len - dt->pos, glm_tool_syntax.tool_calls_start);
+                found = start != NULL;
+                if (found) {
+                    syn = &glm_tool_syntax;
+                    pos = (size_t)(start - raw) + strlen(syn->tool_calls_start);
+                }
+            } else {
+                found = dsml_find_tool_start_from(raw, raw_len, dt->pos, &pos, &syn);
+            }
+            if (!found) {
                 size_t hold = dsml_max_tool_start_len();
                 dt->pos = raw_len > hold ? raw_len - hold : 0;
                 dt->decode = DSML_DECODE_OUTSIDE;
@@ -6829,7 +6847,8 @@ structural:
                     return;
                 }
                 size_t tag_after = (size_t)(tag_end - raw) + 1;
-                bool string_value = dsml_attr_is_string_true(raw, raw_len, tag_start, tag_after);
+                bool string_value = dt->model_syntax == SERVER_MODEL_SYNTAX_GLM ||
+                    dsml_attr_is_string_true(raw, raw_len, tag_start, tag_after);
                 dt->pos = tag_after;
                 if (string_value) {
                     dt->mode = DSML_TRACK_STRING_BODY;
@@ -6853,6 +6872,11 @@ structural:
                 return;
             }
 
+            if (dt->model_syntax == SERVER_MODEL_SYNTAX_GLM) {
+                /* GLM puts function and argument names between tags. */
+                dt->pos++;
+                continue;
+            }
             dt->decode = DSML_DECODE_STRUCTURAL;
             return;
         }
@@ -11301,6 +11325,24 @@ static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
     return ok;
 }
 
+/* A recurrent cache cannot always be truncated in place. Match the agent's
+ * boundary handling and rebuild the retained prefix when rewind invalidates
+ * it, retaining image conditioning as well. */
+static int server_generation_rewind(server *s, server_slot *slot,
+                                     const request *r, int pos,
+                                     char *err, size_t errlen) {
+    pthread_mutex_lock(&s->inference_mu);
+    ds4_session_rewind(slot->session, pos);
+    ds4_tokens prefix = {0};
+    ds4_tokens_copy(&prefix, ds4_session_tokens(slot->session));
+    bool rebuild = ds4_session_common_prefix(slot->session, &prefix) != prefix.len;
+    pthread_mutex_unlock(&s->inference_mu);
+    int rc = rebuild ? server_session_sync_multimodal(s, slot, &prefix,
+        r->images, r->image_count, err, errlen) : 0;
+    ds4_tokens_free(&prefix);
+    return rc;
+}
+
 static bool continue_after_invalid_dsml(server *s, server_slot *slot,
                                         const request *r,
                                         const thinking_state *thinking,
@@ -12429,6 +12471,7 @@ decode_again:
     size_t think_recovery_scan_from = 0;
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
+    dsml_tracker.model_syntax = j->req.model_syntax;
 
     server_generation_enter(s);
     while (!g_stop_requested && !job_cancelled(j) && completion < max_tokens &&
@@ -12453,7 +12496,10 @@ decode_again:
             if (!j->req.top_p_set) top_p = DS4_DEFAULT_TOP_P;
             if (!j->req.min_p_set) min_p = DS4_DEFAULT_MIN_P;
         }
-        if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
+        const bool greedy_tool_syntax = !thinking.inside && in_tool_call &&
+            !dsml_decode_state_uses_payload_sampling(dsml_state);
+        const float payload_temperature = temperature;
+        if (greedy_tool_syntax) {
             temperature = 0.0f;
         }
         const int eos_token = ds4_token_eos(s->engine);
@@ -12476,6 +12522,7 @@ decode_again:
 
         int toks[17];
         int ntok = 0;
+        const int block_start = ds4_session_pos(slot->session);
         if (!s->batched_mode &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
@@ -12506,7 +12553,15 @@ decode_again:
             ntok = 1;
         }
 
+        if (ntok == 0) {
+            finish = "error";
+            snprintf(err, sizeof(err), "decode returned no tokens");
+            break;
+        }
         bool stop_decode = false;
+        bool resample = false;
+        bool text_stop = false;
+        int kept = 0;
         for (int ti = 0; ti < ntok && completion < max_tokens; ti++) {
             if (job_cancelled(j)) {
                 stop_decode = true;
@@ -12524,12 +12579,25 @@ decode_again:
             size_t piece_len = 0;
             char *piece = ds4_token_text(s->engine, token, &piece_len);
             completion++;
+            kept++;
 
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
-            thinking_state_feed(&thinking, piece, piece_len);
+            const bool was_thinking = thinking.inside;
+            if (!dsml_decode_state_is_tool(dsml_tracker.decode))
+                thinking_state_feed(&thinking, piece, piece_len);
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
-                dsml_decode_tracker_update(&dsml_tracker, text.ptr, text.len);
+                if (thinking.inside) {
+                    dsml_decode_tracker_init(&dsml_tracker);
+                    dsml_tracker.model_syntax = j->req.model_syntax;
+                    dsml_tracker.pos = text.len;
+                } else {
+                    if (was_thinking) {
+                        const char *end = find_last_substr(text.ptr, "</think>");
+                        dsml_tracker.pos = end ? (size_t)(end + 8 - text.ptr) : text.len;
+                    }
+                    dsml_decode_tracker_update(&dsml_tracker, text.ptr, text.len);
+                }
             }
 
             size_t stop_pos = 0, stop_len = 0;
@@ -12684,6 +12752,7 @@ decode_again:
                 pthread_mutex_lock(&s->inference_mu);
                 ds4_session_invalidate(slot->session);
                 pthread_mutex_unlock(&s->inference_mu);
+                text_stop = true;
                 stop_decode = true;
                 break;
             }
@@ -12692,6 +12761,27 @@ decode_again:
                 finish = "tool_calls";
                 stop_decode = true;
                 break;
+            }
+            const bool next_greedy = !thinking.inside &&
+                dsml_decode_state_is_tool(dsml_tracker.decode) &&
+                !dsml_decode_state_uses_payload_sampling(dsml_tracker.decode);
+            if (ti + 1 < ntok && payload_temperature > 0.0f &&
+                next_greedy != greedy_tool_syntax) {
+                resample = true;
+                break;
+            }
+        }
+        if (kept < ntok && !text_stop && !job_cancelled(j) && strcmp(finish, "error")) {
+            /* Logits after a rewind belong to the discarded suffix. Re-eval
+             * the last kept token before sampling under a different mode. */
+            int pos = block_start + kept - (resample ? 1 : 0);
+            if (server_generation_rewind(s, slot, &j->req, pos, err, sizeof(err)) != 0 ||
+                (resample && server_eval_token(s, slot, toks[kept - 1], err, sizeof(err)) != 0)) {
+                finish = "error";
+                stop_decode = true;
+            } else {
+                trace_event(s, trace_id, "speculative boundary: kept=%d discarded=%d resample=%d",
+                            kept, ntok - kept, resample);
             }
         }
         if (stop_decode) break;
@@ -17575,6 +17665,43 @@ static void test_decode_tracker_split_parameter_close(void) {
     }
 }
 
+static void test_glm_decode_tracker_boundaries(void) {
+    const char *parts[] = {
+        "prose <tool_call>bash<arg_key>command</arg_key>",
+        "<arg_value>printf '<html>'",
+        "<",
+        "/arg_",
+        "value>",
+        "<arg_key>description</arg_key><arg_value>test",
+        "</arg_value></tool_call>",
+    };
+    const dsml_decode_state expected[] = {
+        DSML_DECODE_STRUCTURAL, DSML_DECODE_STRING_BODY,
+        DSML_DECODE_STRING_BODY, DSML_DECODE_STRUCTURAL,
+        DSML_DECODE_STRUCTURAL, DSML_DECODE_STRING_BODY, DSML_DECODE_OUTSIDE,
+    };
+    /* Check both token-sized fragments and every byte boundary. */
+    for (int bytewise = 0; bytewise <= 1; bytewise++) {
+        dsml_decode_tracker tracker;
+        dsml_decode_tracker_init(&tracker);
+        tracker.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+        buf raw = {0};
+        for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
+            if (bytewise) {
+                for (const char *p = parts[i]; *p; p++) {
+                    buf_putc(&raw, *p);
+                    dsml_decode_tracker_update(&tracker, raw.ptr, raw.len);
+                }
+            } else {
+                buf_puts(&raw, parts[i]);
+                dsml_decode_tracker_update(&tracker, raw.ptr, raw.len);
+            }
+            TEST_ASSERT(tracker.decode == expected[i]);
+        }
+        buf_free(&raw);
+    }
+}
+
 static void test_tool_separator_whitespace_is_not_content(void) {
     const char *generated =
         "<think>need a tool</think>"
@@ -19504,6 +19631,7 @@ static void ds4_server_unit_tests_run(void) {
     test_exact_dsml_tool_replay_can_be_disabled();
     test_dsml_decode_state_separates_structure_and_payload();
     test_decode_tracker_split_parameter_close();
+    test_glm_decode_tracker_boundaries();
     test_tool_memory_max_ids_prunes_oldest();
     test_kv_tool_map_filters_by_dsml_text();
     test_kv_tool_map_restores_before_prompt_render();
