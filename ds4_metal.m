@@ -745,7 +745,6 @@ static double g_stream_expert_timing_split_missing_wait_ms;
 static uint64_t g_stream_expert_timing_load_calls;
 static double g_stream_expert_timing_load_prepare_ms;
 static double g_stream_expert_timing_load_pread_ms;
-static double g_stream_expert_timing_load_modify_ms;
 static double g_stream_expert_timing_load_install_ms;
 static uint64_t g_stream_expert_timing_prepare_batch_reuse_calls;
 static double g_stream_expert_timing_prepare_batch_reuse_ms;
@@ -784,7 +783,6 @@ typedef struct {
     uint64_t load_calls;
     double load_prepare_ms;
     double load_pread_ms;
-    double load_modify_ms;
     double load_install_ms;
     uint64_t prepare_batch_reuse_calls;
     double prepare_batch_reuse_ms;
@@ -3916,7 +3914,6 @@ ds4_gpu_stream_expert_timing_current(void) {
         .load_calls = g_stream_expert_timing_load_calls,
         .load_prepare_ms = g_stream_expert_timing_load_prepare_ms,
         .load_pread_ms = g_stream_expert_timing_load_pread_ms,
-        .load_modify_ms = g_stream_expert_timing_load_modify_ms,
         .load_install_ms = g_stream_expert_timing_load_install_ms,
         .prepare_batch_reuse_calls =
             g_stream_expert_timing_prepare_batch_reuse_calls,
@@ -4032,9 +4029,6 @@ ds4_gpu_stream_expert_timing_delta(
         .load_pread_ms =
             ds4_gpu_stream_expert_timing_delta_f64(current.load_pread_ms,
                                                    previous.load_pread_ms),
-        .load_modify_ms =
-            ds4_gpu_stream_expert_timing_delta_f64(current.load_modify_ms,
-                                                   previous.load_modify_ms),
         .load_install_ms =
             ds4_gpu_stream_expert_timing_delta_f64(current.load_install_ms,
                                                    previous.load_install_ms),
@@ -4160,8 +4154,6 @@ static void ds4_gpu_stream_expert_timing_print(
         load_calls != 0.0 ? s.load_prepare_ms / load_calls : 0.0;
     const double load_pread_avg =
         load_calls != 0.0 ? s.load_pread_ms / load_calls : 0.0;
-    const double load_modify_avg =
-        load_calls != 0.0 ? s.load_modify_ms / load_calls : 0.0;
     const double load_install_avg =
         load_calls != 0.0 ? s.load_install_ms / load_calls : 0.0;
     const double prepare_batch_reuse_avg =
@@ -4201,7 +4193,7 @@ static void ds4_gpu_stream_expert_timing_print(
         cache_layer_count != 0.0 ?
             (double)s.cache_missing_experts / cache_layer_count : 0.0;
     fprintf(stderr,
-            "ds4:   streaming expert timing %s selected_calls=%llu read_avg=%.3f ms sync_avg=%.3f ms copy_avg=%.3f ms bind_avg=%.3f ms read_total=%.3f ms sync_total=%.3f ms copy_total=%.3f ms bind_total=%.3f ms split_layers=%llu resident_experts_avg=%.2f missing_experts_avg=%.2f resident_submit_avg=%.3f ms missing_bind_avg=%.3f ms resident_submit_total=%.3f ms missing_bind_total=%.3f ms missing_load_avg=%.3f ms missing_slot_avg=%.3f ms missing_prune_avg=%.3f ms missing_addr_avg=%.3f ms missing_wait_avg=%.3f ms missing_wait_total=%.3f ms load_calls=%llu load_prepare_avg=%.3f ms load_pread_avg=%.3f ms load_modify_avg=%.3f ms load_install_avg=%.3f ms prepare_batch_reuse_calls=%llu prepare_batch_reuse_avg=%.3f ms prepare_batch_reuse_total=%.3f ms prepare_buffer_calls=%llu prepare_buffer_avg=%.3f ms prepare_buffer_total=%.3f ms prepare_task_experts=%llu prepare_task_avg=%.3f ms prepare_task_total=%.3f ms reuse_scan_calls=%llu reuse_scan_entries_avg=%.1f reuse_scan_avg=%.3f ms reuse_scan_total=%.3f ms reuse_clear_total=%.3f ms readahead_calls=%llu readahead_avg=%.3f ms readahead_total=%.3f ms readahead_gib=%.2f cache_all_resident=%llu cache_all_missing=%llu cache_mixed=%llu cache_resident_avg=%.2f cache_missing_avg=%.2f\n",
+            "ds4:   streaming expert timing %s selected_calls=%llu read_avg=%.3f ms sync_avg=%.3f ms copy_avg=%.3f ms bind_avg=%.3f ms read_total=%.3f ms sync_total=%.3f ms copy_total=%.3f ms bind_total=%.3f ms split_layers=%llu resident_experts_avg=%.2f missing_experts_avg=%.2f resident_submit_avg=%.3f ms missing_bind_avg=%.3f ms resident_submit_total=%.3f ms missing_bind_total=%.3f ms missing_load_avg=%.3f ms missing_slot_avg=%.3f ms missing_prune_avg=%.3f ms missing_addr_avg=%.3f ms missing_wait_avg=%.3f ms missing_wait_total=%.3f ms load_calls=%llu load_prepare_avg=%.3f ms load_pread_avg=%.3f ms load_install_avg=%.3f ms prepare_batch_reuse_calls=%llu prepare_batch_reuse_avg=%.3f ms prepare_batch_reuse_total=%.3f ms prepare_buffer_calls=%llu prepare_buffer_avg=%.3f ms prepare_buffer_total=%.3f ms prepare_task_experts=%llu prepare_task_avg=%.3f ms prepare_task_total=%.3f ms reuse_scan_calls=%llu reuse_scan_entries_avg=%.1f reuse_scan_avg=%.3f ms reuse_scan_total=%.3f ms reuse_clear_total=%.3f ms readahead_calls=%llu readahead_avg=%.3f ms readahead_total=%.3f ms readahead_gib=%.2f cache_all_resident=%llu cache_all_missing=%llu cache_mixed=%llu cache_resident_avg=%.2f cache_missing_avg=%.2f\n",
             scope ? scope : "total",
             (unsigned long long)s.selected_calls,
             selected_read_avg,
@@ -4228,7 +4220,6 @@ static void ds4_gpu_stream_expert_timing_print(
             (unsigned long long)s.load_calls,
             load_prepare_avg,
             load_pread_avg,
-            load_modify_avg,
             load_install_avg,
             (unsigned long long)s.prepare_batch_reuse_calls,
             prepare_batch_reuse_avg,
@@ -13092,13 +13083,11 @@ static void ds4_gpu_stream_expert_timing_note_split_missing_detail(
 static void ds4_gpu_stream_expert_timing_note_load_detail(
         double prepare_ms,
         double pread_ms,
-        double modify_ms,
         double install_ms) {
     if (!ds4_gpu_stream_expert_timing_summary_enabled()) return;
     g_stream_expert_timing_load_calls++;
     g_stream_expert_timing_load_prepare_ms += prepare_ms;
     g_stream_expert_timing_load_pread_ms += pread_ms;
-    g_stream_expert_timing_load_modify_ms += modify_ms;
     g_stream_expert_timing_load_install_ms += install_ms;
 }
 
@@ -14490,7 +14479,6 @@ static int ds4_gpu_stream_compact_addr_ensure_buffers(uint32_t layer) {
         }
         b.label = label;
         memset([b contents], 0, bytes);
-        [b didModifyRange:NSMakeRange(0, bytes)];
         switch (i) {
         case 0:
             g_stream_compact_gate_addr_buffers[layer] = b;
@@ -14553,10 +14541,6 @@ static int ds4_gpu_stream_compact_addr_prepare(
     memcpy([ub contents], up_values, addr_bytes);
     memcpy([db contents], down_values, addr_bytes);
     memcpy([ib contents], slot_ids, ids_bytes);
-    [gb didModifyRange:NSMakeRange(0, addr_bytes)];
-    [ub didModifyRange:NSMakeRange(0, addr_bytes)];
-    [db didModifyRange:NSMakeRange(0, addr_bytes)];
-    [ib didModifyRange:NSMakeRange(0, ids_bytes)];
 
     *gate_addrs = gb;
     *up_addrs = ub;
@@ -14598,7 +14582,6 @@ static int ds4_gpu_stream_selected_ids_prepare(
     int32_t ids[DS4_METAL_MAX_ROUTED_EXPERT_USED] = {0};
     memcpy(ids, selected_ids, (size_t)n_selected * sizeof(ids[0]));
     memcpy([b contents], ids, bytes);
-    [b didModifyRange:NSMakeRange(0, bytes)];
 
     *selected_buf = b;
     *selected_off = 0;
@@ -14631,7 +14614,6 @@ static int ds4_gpu_stream_expert_cache_ensure_addr_buffers(uint32_t layer) {
             (i == 1 ? @"ds4_stream_expert_up_addresses" :
                       @"ds4_stream_expert_down_addresses");
         memset([b contents], 0, bytes);
-        [b didModifyRange:NSMakeRange(0, bytes)];
         if (i == 0) {
             g_stream_expert_cache_gate_addr_buffers[layer] = b;
         } else if (i == 1) {
@@ -14659,7 +14641,6 @@ static void ds4_gpu_stream_expert_cache_zero_addr_slot(uint32_t layer, uint32_t 
         if (!buffers[i]) continue;
         uint64_t *addr = (uint64_t *)((uint8_t *)[buffers[i] contents] + off);
         *addr = 0;
-        [buffers[i] didModifyRange:NSMakeRange(off, sizeof(uint64_t))];
     }
 }
 
@@ -14693,7 +14674,6 @@ static int ds4_gpu_stream_expert_cache_set_addr_slot_raw(
     for (uint32_t i = 0; i < 3; i++) {
         uint64_t *addr = (uint64_t *)((uint8_t *)[buffers[i] contents] + off);
         *addr = values[i];
-        [buffers[i] didModifyRange:NSMakeRange(off, sizeof(uint64_t))];
     }
     return 1;
 }
@@ -14883,11 +14863,6 @@ static int ds4_gpu_stream_full_expert_addr_table_prepare(
                 down_addr[expert] = 0;
             }
         }
-        const NSUInteger bytes =
-            (NSUInteger)DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT * sizeof(uint64_t);
-        for (uint32_t i = 0; i < 3; i++) {
-            [buffers[i] didModifyRange:NSMakeRange(0, bytes)];
-        }
     }
 
     if (gate_addrs) *gate_addrs = g_stream_expert_cache_gate_addr_buffers[layer];
@@ -14916,7 +14891,6 @@ static id<MTLBuffer> ds4_gpu_stream_expert_validate_status_buffer(void) {
     }
     b.label = @"ds4_stream_expert_validate_status";
     memset([b contents], 0, bytes);
-    [b didModifyRange:NSMakeRange(0, bytes)];
     g_stream_expert_validate_status_buffer = b;
     return b;
 }
@@ -14972,7 +14946,6 @@ static int ds4_gpu_stream_expert_cache_validate_selected(
     const NSUInteger status_bytes =
         (NSUInteger)DS4_METAL_STREAM_EXPERT_VALIDATE_WORDS * sizeof(uint32_t);
     memset([status contents], 0, status_bytes);
-    [status didModifyRange:NSMakeRange(0, status_bytes)];
 
     ds4_gpu_stream_expert_validate_args args = {
         .n_total_expert = n_total_expert,
@@ -15143,7 +15116,6 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
             const NSUInteger bytes =
                 (NSUInteger)DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT * sizeof(uint64_t);
             memset([buffers[i] contents], 0, bytes);
-            [buffers[i] didModifyRange:NSMakeRange(0, bytes)];
         }
     }
     g_stream_expert_cache_bytes = 0;
@@ -15204,7 +15176,6 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
         g_stream_expert_timing_load_calls = 0;
         g_stream_expert_timing_load_prepare_ms = 0.0;
         g_stream_expert_timing_load_pread_ms = 0.0;
-        g_stream_expert_timing_load_modify_ms = 0.0;
         g_stream_expert_timing_load_install_ms = 0.0;
         g_stream_expert_timing_prepare_batch_reuse_calls = 0;
         g_stream_expert_timing_prepare_batch_reuse_ms = 0.0;
@@ -16229,9 +16200,6 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_get_protec
     }
     ds4_gpu_stream_expert_cache_note_pread(layer, read_bytes, read_ms);
 
-    [gate_buf didModifyRange:NSMakeRange(gate_inner, (NSUInteger)gate_expert_bytes)];
-    [up_buf didModifyRange:NSMakeRange(up_inner, (NSUInteger)gate_expert_bytes)];
-    [down_buf didModifyRange:NSMakeRange(down_inner, (NSUInteger)down_expert_bytes)];
     if (getenv("DS4_METAL_STREAMING_EXPERT_PREAD_PROFILE") != NULL) {
         fprintf(stderr,
                 "ds4: Metal streaming expert parallel pread layer=%u experts=1 tensors=3 "
@@ -16323,18 +16291,7 @@ static int ds4_gpu_stream_expert_pending_load_install(
     ds4_gpu_stream_expert_cache_note_pread(p->layer, read_bytes, elapsed_ms);
     const int load_timing = ds4_gpu_stream_expert_timing_summary_enabled();
     double load_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
-    double load_modify_ms = 0.0;
     double load_install_ms = 0.0;
-    for (uint32_t load_i = 0; load_i < p->n_loads; load_i++) {
-        [p->gate_bufs[load_i] didModifyRange:NSMakeRange(p->gate_inners[load_i], (NSUInteger)p->gate_expert_bytes)];
-        [p->up_bufs[load_i] didModifyRange:NSMakeRange(p->up_inners[load_i], (NSUInteger)p->gate_expert_bytes)];
-        [p->down_bufs[load_i] didModifyRange:NSMakeRange(p->down_inners[load_i], (NSUInteger)p->down_expert_bytes)];
-    }
-    if (load_timing) {
-        const double now_ms = ds4_gpu_now_ms();
-        load_modify_ms = now_ms - load_t0;
-        load_t0 = now_ms;
-    }
 
     ds4_gpu_stream_expert_cache_entry
         *loaded_entries[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
@@ -16379,7 +16336,6 @@ static int ds4_gpu_stream_expert_pending_load_install(
         load_install_ms = ds4_gpu_now_ms() - load_t0;
         ds4_gpu_stream_expert_timing_note_load_detail(p->prepare_ms,
                                                       elapsed_ms,
-                                                      load_modify_ms,
                                                       load_install_ms);
     }
     if (ds4_gpu_stream_expert_pending_load_profile_enabled()) {
@@ -16811,7 +16767,6 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
     const int load_timing = ds4_gpu_stream_expert_timing_summary_enabled();
     double load_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
     double load_prepare_ms = 0.0;
-    double load_modify_ms = 0.0;
     double load_install_ms = 0.0;
 
     uint32_t load_slots[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
@@ -17103,18 +17058,6 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
         ds4_gpu_stream_expert_cache_note_pread(layer, read_bytes, read_ms);
     }
 
-    if (!gpu_copy_source) {
-        for (uint32_t load_i = 0; load_i < n_loads; load_i++) {
-            [gate_bufs[load_i] didModifyRange:NSMakeRange(gate_inners[load_i], (NSUInteger)gate_expert_bytes)];
-            [up_bufs[load_i] didModifyRange:NSMakeRange(up_inners[load_i], (NSUInteger)gate_expert_bytes)];
-            [down_bufs[load_i] didModifyRange:NSMakeRange(down_inners[load_i], (NSUInteger)down_expert_bytes)];
-        }
-    }
-    if (load_timing) {
-        const double now_ms = ds4_gpu_now_ms();
-        load_modify_ms = now_ms - load_t0;
-        load_t0 = now_ms;
-    }
     if (gpu_copy_source &&
         getenv("DS4_METAL_STREAMING_PREFILL_CACHE_SEED_PROFILE") != NULL) {
         fprintf(stderr,
@@ -17173,7 +17116,6 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
         load_install_ms = ds4_gpu_now_ms() - load_t0;
         ds4_gpu_stream_expert_timing_note_load_detail(load_prepare_ms,
                                                       read_ms,
-                                                      load_modify_ms,
                                                       load_install_ms);
     }
     return 1;
@@ -17483,7 +17425,6 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
     uint32_t n_loads = 0;
     uint32_t n_tasks = 0;
     double load_prepare_ms = 0.0;
-    double load_modify_ms = 0.0;
     double load_install_ms = 0.0;
     double load_timing_t0 = ds4_gpu_stream_expert_timing_summary_enabled() ?
                             ds4_gpu_now_ms() : 0.0;
@@ -17628,18 +17569,6 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         if (load_timing_t0 != 0.0) {
             load_timing_t0 = ds4_gpu_now_ms();
         }
-        if (ok) {
-            for (uint32_t load_i = 0; load_i < n_loads; load_i++) {
-                [gate_bufs[load_i] didModifyRange:NSMakeRange(gate_inners[load_i], (NSUInteger)gate_expert_bytes)];
-                [up_bufs[load_i] didModifyRange:NSMakeRange(up_inners[load_i], (NSUInteger)gate_expert_bytes)];
-                [down_bufs[load_i] didModifyRange:NSMakeRange(down_inners[load_i], (NSUInteger)down_expert_bytes)];
-            }
-        }
-        if (load_timing_t0 != 0.0) {
-            const double now_ms = ds4_gpu_now_ms();
-            load_modify_ms = now_ms - load_timing_t0;
-            load_timing_t0 = now_ms;
-        }
         if (ok && getenv("DS4_METAL_STREAMING_EXPERT_PREAD_PROFILE") != NULL) {
             fprintf(stderr,
                     "ds4: Metal streaming batch expert parallel pread layer=%u experts=%u tensors=%u "
@@ -17682,7 +17611,6 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
             load_install_ms = ds4_gpu_now_ms() - load_timing_t0;
             ds4_gpu_stream_expert_timing_note_load_detail(load_prepare_ms,
                                                           read_ms,
-                                                          load_modify_ms,
                                                           load_install_ms);
         }
     }
@@ -18546,7 +18474,6 @@ static DS4MetalQ4ExpertTable *ds4_gpu_q4_expert_table(
             [expert_buffers addObject:expert_buf];
         }
     }
-    [arg_buffer didModifyRange:NSMakeRange(0, [encoder encodedLength])];
 
     if (getenv("DS4_METAL_Q4_EXPERT_TABLE_PROFILE") != NULL) {
         fprintf(stderr,
@@ -18662,9 +18589,6 @@ static DS4MetalQ4ExpertTable *ds4_gpu_q4_expert_address_table(
         fprintf(stderr, "ds4: Metal GPU addresses require macOS 13 or newer\n");
         return nil;
     }
-
-    [address_buffer didModifyRange:NSMakeRange(0,
-        (NSUInteger)n_total_expert * sizeof(uint64_t))];
 
     if (getenv("DS4_METAL_Q4_EXPERT_TABLE_PROFILE") != NULL) {
         fprintf(stderr,

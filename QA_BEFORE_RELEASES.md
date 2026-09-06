@@ -717,7 +717,7 @@ SSD streaming is a capacity path, so test both correctness and user experience.
   precision or activation precision. With the same model and prefill chunks,
   require identical complete logits and deterministic output across cache
   policies. Test numerical-kernel changes separately against a reference.
-- Run `make test-metal-ssd-experts` on an idle Metal host. It exercises all
+- Run `MTL_DEBUG_LAYER=1 make test-metal-ssd-experts` on an idle Metal host. It exercises all
   eight routed slots through hits and evictions, requires byte-identical
   outputs with different cache capacities, and replaces more than 4,096
   layer mappings while retaining a separate auxiliary model mapping.
