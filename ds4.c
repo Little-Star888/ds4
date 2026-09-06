@@ -42255,10 +42255,12 @@ static bool glm_graph_stream_layer_expert_cache_supported(
 }
 
 static bool glm_graph_stream_prefill_expert_addr_supported(
+        const ds4_glm_gpu_graph *g,
         const ds4_weights       *weights,
         const ds4_layer_weights *l,
         uint32_t                 il,
         uint32_t                 n_tokens) {
+    (void)g;
     if (il < DS4_N_LEADING_DENSE) return true;
     if (n_tokens <= 1) return false;
 #ifdef DS4_ROCM_BUILD
@@ -42292,6 +42294,23 @@ static bool glm_graph_stream_prefill_expert_addr_supported(
                    gate_expert_bytes,
                    down_expert_bytes) >= required;
 #else
+#ifdef __APPLE__
+    if (g && g->tp_world < 2 && l &&
+        l->ffn_gate_exps && l->ffn_up_exps && l->ffn_down_exps &&
+        l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+        l->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+        l->ffn_down_exps->type == DS4_TENSOR_IQ2_XXS &&
+        DS4_N_EXPERT_USED == 8 && n_tokens < 256 &&
+        getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE") == NULL &&
+        getenv("DS4_METAL_DISABLE_TINY_PAIR_SWIGLU_FUSION") == NULL &&
+        getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") == NULL &&
+        glm_stream_selected_expert_cache_supported(l, il)) {
+        uint64_t gate_bytes = 0, down_bytes = 0;
+        if (streaming_layer_gate_down_expert_bytes(l, &gate_bytes, &down_bytes) &&
+            ds4_gpu_stream_expert_cache_budget_for_expert_size(gate_bytes, down_bytes) >=
+                DS4_N_EXPERT) return true;
+    }
+#endif
     return glm_stream_expert_cache_addr_supported(weights, l, il);
 #endif
 }
@@ -42359,7 +42378,7 @@ static bool glm_graph_stream_map_prefill_layer(
     }
     const bool addr_supported =
         weights && il < DS4_N_LAYER &&
-        glm_graph_stream_prefill_expert_addr_supported(weights,
+        glm_graph_stream_prefill_expert_addr_supported(g, weights,
                                                        &weights->layer[il],
                                                        il,
                                                        n_tokens);
@@ -47104,7 +47123,7 @@ static bool glm_graph_encode_ffn_batch(
         !glm_graph_env_present(
                 "DS4_ROCM_DISABLE_STREAMING_PREFILL_SELECTED_ASYNC_LOAD",
                 "DS4_METAL_DISABLE_STREAMING_PREFILL_SELECTED_ASYNC_LOAD") &&
-        glm_graph_stream_prefill_expert_addr_supported(weights, l, il, n_tokens);
+        glm_graph_stream_prefill_expert_addr_supported(g, weights, l, il, n_tokens);
     if (rocm_batch_selected_shared_overlap) {
         uint64_t selected_event = 0;
         if (ds4_gpu_signal_selected_readback_ready(&selected_event) != 0) {

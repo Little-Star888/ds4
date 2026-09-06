@@ -9,7 +9,8 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-enum { D = 256, H = 512, E = 256, N = 8, STEPS = 48 };
+enum { E = 256, N = 8, STEPS = 48 };
+static int D = 256, H = 512;
 typedef struct { uint16_t d; uint8_t qs[64]; } iq2_block;
 
 static uint32_t rng = 1;
@@ -63,8 +64,86 @@ static int check_mapping_lifetime(void) {
     return ok;
 }
 
-int main(void) {
-    const uint64_t row = sizeof(iq2_block);
+static int check_batch_cache(void *model, uint64_t bytes, uint64_t expert) {
+    enum { T = 257 };
+    const uint64_t tensor = E * expert;
+    const uint64_t row = D / 256 * sizeof(iq2_block);
+    const uint64_t down_row = H / 256 * sizeof(iq2_block);
+    const size_t xb = T * D * sizeof(float), mb = T * N * H * sizeof(float);
+    const size_t ob = T * D * sizeof(float), ib = T * N * sizeof(int32_t);
+    float *x = malloc(xb), *weights = malloc(ib), *ref = malloc(ob), *got = malloc(ob);
+    float *ref_mid = malloc(mb), *got_mid = malloc(mb);
+    int32_t *ids = malloc(ib);
+    ds4_gpu_tensor *xt = ds4_gpu_tensor_alloc(xb), *it = ds4_gpu_tensor_alloc(ib);
+    ds4_gpu_tensor *wt = ds4_gpu_tensor_alloc(ib), *gate = ds4_gpu_tensor_alloc(mb);
+    ds4_gpu_tensor *up = ds4_gpu_tensor_alloc(mb), *mid = ds4_gpu_tensor_alloc(mb);
+    ds4_gpu_tensor *down = ds4_gpu_tensor_alloc(T * N * D * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(ob);
+    int ok = x && weights && ref && got && ref_mid && got_mid && ids &&
+             xt && it && wt && gate && up && mid && down && out;
+    if (!ok) goto done;
+    for (int i = 0; i < T * D; i++) x[i] = ((int)(random_u32() % 101) - 50) / 32.0f;
+    for (int t = 0; t < T; t++) for (int k = 0; k < N; k++) {
+        ids[t * N + k] = (t * 13 + k * 17) % E;
+        weights[t * N + k] = (k + 1) / 36.0f;
+    }
+    ok = ds4_gpu_tensor_write(xt, 0, x, xb) &&
+         ds4_gpu_tensor_write(it, 0, ids, ib) &&
+         ds4_gpu_tensor_write(wt, 0, weights, ib);
+    const uint32_t counts[] = {1, 2, 5, 6, 7, 16, 31, 32, 43, 114, 255, 256, 257, 16, 43};
+    for (int quality = 0; quality < 2 && ok; quality++) {
+        ds4_gpu_set_quality(quality);
+        ds4_gpu_set_streaming_expert_cache_budget(E);
+        for (size_t c = 0; c < sizeof(counts) / sizeof(*counts) && ok; c++) {
+            const uint32_t n = counts[c];
+            if (c + 1 == sizeof(counts) / sizeof(*counts))
+                ds4_gpu_set_streaming_expert_cache_budget(E - 1);
+            bool half[2] = {false, false};
+            for (int streamed = 0; streamed < 2 && ok; streamed++) {
+                ok = ds4_gpu_tensor_fill_f32(mid, NAN, T * N * H) &&
+                     ds4_gpu_tensor_fill_f32(out, NAN, T * D) &&
+                     ds4_gpu_begin_commands() && ds4_gpu_routed_moe_batch_tensor(
+                        out, gate, up, mid, down, model, bytes, 0, tensor, 2 * tensor,
+                        16, 16, expert, row, expert, down_row, D, H, D,
+                        it, wt, E, N, 7.0f, xt, 3 + c % 2, n, &half[streamed],
+                        !streamed) && ds4_gpu_end_commands() &&
+                     ds4_gpu_tensor_read(out, 0, streamed ? got : ref, n * D * sizeof(float)) &&
+                     ds4_gpu_tensor_read(mid, 0, streamed ? got_mid : ref_mid,
+                        n * N * H * (half[streamed] ? sizeof(uint16_t) : sizeof(float)));
+            }
+            if (!ok || half[0] != half[1] || memcmp(ref, got, n * D * sizeof(float)) ||
+                memcmp(ref_mid, got_mid, n * N * H *
+                    (half[0] ? sizeof(uint16_t) : sizeof(float)))) {
+                fprintf(stderr, "SSD batch mismatch tokens=%u quality=%d\n", n, quality);
+                ok = 0;
+            }
+            if (c == 0 && ds4_gpu_stream_expert_cache_current_count() == 0) {
+                fprintf(stderr, "SSD batch did not populate the expert cache\n");
+                ok = 0;
+            }
+            for (size_t i = 0; i < n * D && ok; i++) if (!isfinite(got[i])) ok = 0;
+        }
+    }
+    ds4_gpu_set_quality(false);
+done:
+    free(x); free(weights); free(ref); free(got); free(ref_mid); free(got_mid); free(ids);
+    ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(it); ds4_gpu_tensor_free(wt);
+    ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(up); ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(down); ds4_gpu_tensor_free(out);
+    fprintf(stderr, "Metal SSD IQ2 batch cache exact outputs: %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--full-glm-shape")) {
+        D = 6144;
+        H = 2048;
+    } else if (argc != 1) {
+        fprintf(stderr, "usage: %s [--full-glm-shape]\n", argv[0]);
+        return 1;
+    }
+    const uint64_t row = D / 256 * sizeof(iq2_block);
+    const uint64_t down_row = H / 256 * sizeof(iq2_block);
     const uint64_t expert = H * row;
     const uint64_t tensor = E * expert;
     const size_t bytes = 3 * tensor;
@@ -123,7 +202,7 @@ int main(void) {
                  ds4_gpu_begin_commands() &&
                  ds4_gpu_routed_moe_one_tensor(
                     out, gate, up, mid, down, model, bytes, 0, tensor, 2 * tensor,
-                    16, 16, expert, row, expert, 2 * row, D, H, D,
+                    16, 16, expert, row, expert, down_row, D, H, D,
                     it, wt, E, N, 7.0f, xt, NULL, 3, !streamed) &&
                  ds4_gpu_end_commands() &&
                  ds4_gpu_tensor_read(out, 0, streamed ? actual : reference,
@@ -149,6 +228,7 @@ int main(void) {
     ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(it); ds4_gpu_tensor_free(wt);
     ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(up); ds4_gpu_tensor_free(mid);
     ds4_gpu_tensor_free(down); ds4_gpu_tensor_free(out);
+    if (ok) ok = check_batch_cache(model, bytes, expert);
     ds4_gpu_print_memory_report("SSD expert test");
     if (ok) ok = check_mapping_lifetime();
     ds4_gpu_cleanup();
