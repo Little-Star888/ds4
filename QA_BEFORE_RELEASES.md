@@ -762,6 +762,14 @@ SSD streaming is a capacity path, so test both correctness and user experience.
   GGUF, a Metal OOM, repeated garbage tokens, or a compact-attention result
   that omits the RoPE score is a release blocker.
 
+  Also run `python3 tests/test_glm_rope_prefill.py --model "$GLM_SSD_MODEL"`
+  under the external memory guard. This checks all next-token logits against
+  the general attention path, then requires a correct answer to a complete
+  question. Use the full, non-Flash checkpoint: Flash has no RoPE contribution
+  and cannot catch this dispatch regression. `make test-glm-attention` covers
+  nonzero RoPE against a double-precision reference with F16/F32 caches,
+  initial and continued prefill, and incomplete head groups.
+
 September 6 focused SSD pass, 128 GB M5 Max only: GLM 5.3 Flash Q4_K
 (177.77 GiB) and DeepSeek Flash Vision Exp MXFP4 (145.26 GiB). Automatic
 budgets and existing prefill chunk sizes were used, without speculation.
