@@ -179,7 +179,6 @@ typedef struct agent_tail_capture {
 
 typedef enum {
     AGENT_MD_PENDING_NONE,
-    AGENT_MD_PENDING_STAR,
     AGENT_MD_PENDING_BACKTICK,
 } agent_markdown_pending;
 
@@ -198,6 +197,9 @@ typedef struct {
     bool md_bold;
     bool md_italic;
     bool md_inline_code;
+    char md_inline[4096];
+    size_t md_inline_len;
+    bool md_escape;
     bool md_code_block;
     bool md_fence_info;
     bool md_code_line_start;
@@ -474,10 +476,14 @@ static bool agent_worker_images_fit_tokens(const agent_worker *w,
 }
 
 static void write_all(int fd, const char *p, size_t n) {
+    if (fd == STDOUT_FILENO) {
+        linenoiseWrite(fd, p, n);
+        return;
+    }
     while (n) {
         ssize_t wr = write(fd, p, n);
-        if (wr < 0) {
-            if (errno == EINTR) continue;
+        if (wr <= 0) {
+            if (wr < 0 && errno == EINTR) continue;
             return;
         }
         p += wr;
@@ -2090,8 +2096,7 @@ static void agent_dsml_feed(agent_dsml_parser *p, const char *s, size_t n) {
  *
  * This renderer handles only the cheap markdown cues that make terminal output
  * readable: **bold**, *italic*, inline code, and fenced code blocks.  It is a
- * streaming parser, so it buffers only ambiguous marker bytes long enough to
- * decide whether they are formatting or literal text.
+ * streaming parser with a bounded buffer for ambiguous inline spans.
  */
 
 static void agent_tail_capture_append(agent_tail_capture *t,
@@ -2880,10 +2885,21 @@ static void renderer_code_emit_buffered_line(agent_token_renderer *r,
     bool changed = renderer_code_scan_line(r, &final_ml_comment);
     bool repaint = changed && renderer_code_line_can_repaint(r);
     if (repaint) {
+        agent_tail_capture frame = {
+            .cap = 64 * (r->md_code_line_len +
+                         (r->md_code_line_prefix ? strlen(r->md_code_line_prefix) : 0) + 1) + 256
+        };
+        agent_tail_capture *capture = r->capture;
+        r->capture = &frame;
         renderer_reset_color(r);
         renderer_write(r, "\r\x1b[0K", 5);
         renderer_code_write_line_prefix(r);
         renderer_syntax_emit_line(r, r->md_code_line, r->md_code_line_len);
+        r->capture = capture;
+        size_t len;
+        char *text = agent_tail_capture_take(&frame, &len);
+        renderer_write(r, text, len);
+        free(text);
     } else {
         r->md_code_in_ml_comment = final_ml_comment;
     }
@@ -2981,34 +2997,58 @@ static void renderer_code_end(agent_token_renderer *r) {
     r->md_code_line_prefix_color = NULL;
 }
 
-/* Tiny streaming Markdown highlighter for assistant prose.  It deliberately
- * recognizes only delimiters that the model commonly emits in short answers:
- * **bold**, *italic*, `inline code`, ``inline code`` and fenced code blocks.
- * The state machine holds only possible delimiter bytes; once a byte is known
- * to be ordinary text it is sent to the raw UTF-8 writer above.  Tool
- * visualization and redirected output bypass this layer. */
+/* Tool visualization and redirected output bypass Markdown formatting. */
 static void renderer_markdown_clear_pending(agent_token_renderer *r) {
     r->md_pending = AGENT_MD_PENDING_NONE;
     r->md_pending_len = 0;
 }
 
+static bool renderer_markdown_inline_pair(agent_token_renderer *r, size_t *delimiter) {
+    size_t n = r->md_inline_len, open = 1, close = 0;
+    char ch = r->md_inline[0];
+    while (open < n && r->md_inline[open] == ch) open++;
+    while (close < n && r->md_inline[n - close - 1] == ch) close++;
+    *delimiter = open;
+    if (open > 2 || close != open || n <= open + close) return false;
+    if (ch == '*') {
+        if (isspace((unsigned char)r->md_inline[open]) ||
+            isspace((unsigned char)r->md_inline[n - close - 1])) return false;
+        size_t escapes = 0, pos = n - close;
+        while (pos && r->md_inline[--pos] == '\\') escapes++;
+        if (escapes & 1) return false;
+    }
+    return true;
+}
+
+static void renderer_markdown_inline_flush(agent_token_renderer *r, bool format) {
+    size_t n = r->md_inline_len, delimiter = 0;
+    if (!n) return;
+    bool paired = format && renderer_markdown_inline_pair(r, &delimiter);
+    bool code = r->md_inline[0] == '`' && paired;
+    r->md_inline_code = code;
+    r->md_bold = paired && !code && delimiter == 2;
+    r->md_italic = paired && !code && delimiter == 1;
+    size_t from = paired ? delimiter : 0, to = paired ? n - delimiter : n;
+    for (size_t i = from; i < to; i++) {
+        if (!code && r->md_inline[i] == '\\' && i + 1 < to &&
+            ispunct((unsigned char)r->md_inline[i + 1])) i++;
+        renderer_write_char_raw(r, r->md_inline[i]);
+    }
+    r->md_inline_len = 0;
+    r->md_inline_code = r->md_bold = r->md_italic = false;
+    renderer_reset_color(r);
+}
+
 static void renderer_markdown_emit_pending_literals(agent_token_renderer *r) {
-    char c;
-    if (r->md_pending == AGENT_MD_PENDING_STAR) {
-        c = '*';
-    } else if (r->md_pending == AGENT_MD_PENDING_BACKTICK) {
-        c = '`';
-    } else {
-        return;
+    renderer_markdown_inline_flush(r, false);
+    if (r->md_escape) {
+        renderer_write_char_raw(r, '\\');
+        r->md_escape = false;
     }
     size_t count = r->md_pending_len;
     renderer_markdown_clear_pending(r);
-    if (r->md_code_block) {
-        if (c == '`') renderer_code_emit_backtick_literals(r, count);
-        else for (size_t i = 0; i < count; i++) renderer_code_byte(r, c);
-        return;
-    }
-    for (size_t i = 0; i < count; i++) renderer_write_char_raw(r, c);
+    if (r->md_code_block) renderer_code_emit_backtick_literals(r, count);
+    else for (size_t i = 0; i < count; i++) renderer_write_char_raw(r, '`');
 }
 
 static void renderer_markdown_commit_backticks(agent_token_renderer *r) {
@@ -3018,24 +3058,14 @@ static void renderer_markdown_commit_backticks(agent_token_renderer *r) {
         for (size_t i = 0; i < count; i++) renderer_write_plain_byte(r, '`');
         if (r->md_code_block) renderer_code_end(r);
         else renderer_code_begin(r);
-        return;
-    }
-    if (r->md_code_block) {
+    } else if (r->md_code_block) {
         renderer_code_emit_backtick_literals(r, count);
-        return;
     }
-    /* Support both `code` and ``code``.  The latter is uncommon in model
-     * replies, but accepting it costs nothing and avoids leaking delimiters. */
-    r->md_inline_code = !r->md_inline_code;
 }
 
-static bool renderer_space_byte(char c) {
-    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
-}
-
-/* Consume one byte of markdown-aware assistant output.  Backticks and stars
- * are held in r->pending until the parser knows whether they form a marker;
- * all ordinary text is emitted with the current terminal attributes. */
+/* Plain text streams immediately. An ambiguous inline span is held until its
+ * closing delimiter, a newline, or 4 KiB; without a pair it is printed literally.
+ * Code fences keep their existing line-at-a-time streaming highlighter. */
 static void renderer_markdown_feed(agent_token_renderer *r, char c) {
     if (r->md_fence_info) {
         if (c == '\n') {
@@ -3049,60 +3079,71 @@ static void renderer_markdown_feed(agent_token_renderer *r, char c) {
             unsigned char uc = (unsigned char)c;
             if (r->md_fence_lang_len + 1 < sizeof(r->md_fence_lang) &&
                 (isalnum(uc) || c == '_' || c == '-' || c == '+' || c == '#'))
-            {
                 r->md_fence_lang[r->md_fence_lang_len++] = c;
-            }
             renderer_write_plain_byte(r, c);
         }
         return;
     }
-
     if (r->md_pending == AGENT_MD_PENDING_BACKTICK) {
-        if (c == '`') {
-            r->md_pending_len++;
-            return;
-        }
+        if (c == '`') { r->md_pending_len++; return; }
         renderer_markdown_commit_backticks(r);
         renderer_markdown_feed(r, c);
         return;
     }
-
-    if (r->md_pending == AGENT_MD_PENDING_STAR) {
-        renderer_markdown_clear_pending(r);
-        if (!r->md_inline_code && !r->md_code_block && c == '*') {
-            r->md_bold = !r->md_bold;
-            return;
-        }
-        if (!r->md_inline_code && !r->md_code_block &&
-            (r->md_italic || !renderer_space_byte(c)))
-        {
-            r->md_italic = !r->md_italic;
+    if (r->md_code_block) {
+        if (c == '`' && r->md_code_line_start) {
+            r->md_pending = AGENT_MD_PENDING_BACKTICK;
+            r->md_pending_len = 1;
+        } else renderer_code_byte(r, c);
+        return;
+    }
+    if (r->md_inline_len) {
+        size_t delimiter;
+        if (c != r->md_inline[0] && renderer_markdown_inline_pair(r, &delimiter)) {
+            renderer_markdown_inline_flush(r, true);
             renderer_markdown_feed(r, c);
             return;
         }
-        renderer_write_char_raw(r, '*');
-        renderer_markdown_feed(r, c);
+        size_t n = r->md_inline_len, run = 0;
+        while (run < n && r->md_inline[run] == r->md_inline[0]) run++;
+        if (run == n && c != r->md_inline[0]) {
+            if (r->md_inline[0] == '`' && run >= 3) {
+                r->md_inline_len = 0;
+                for (size_t i = 0; i < run; i++) renderer_write_plain_byte(r, '`');
+                renderer_code_begin(r);
+                renderer_markdown_feed(r, c);
+                return;
+            }
+            if (isspace((unsigned char)c) || run > 2) {
+                renderer_markdown_inline_flush(r, false);
+                renderer_markdown_feed(r, c);
+                return;
+            }
+        }
+        if (c == '\n' || r->md_inline_len == sizeof(r->md_inline)) {
+            renderer_markdown_inline_flush(r, false);
+            renderer_markdown_feed(r, c);
+            return;
+        }
+        r->md_inline[r->md_inline_len++] = c;
         return;
     }
-
-    if (c == '`' && (!r->md_code_block || r->md_code_line_start)) {
-        r->md_pending = AGENT_MD_PENDING_BACKTICK;
-        r->md_pending_len = 1;
-        return;
+    if (r->md_escape) {
+        r->md_escape = false;
+        if (ispunct((unsigned char)c)) { renderer_write_char_raw(r, c); return; }
+        renderer_write_char_raw(r, '\\');
     }
-    if (r->md_code_block) {
-        renderer_code_byte(r, c);
-        return;
-    }
-    if (!r->md_inline_code && !r->md_code_block && c == '*') {
-        r->md_pending = AGENT_MD_PENDING_STAR;
-        r->md_pending_len = 1;
+    if (c == '\\') { r->md_escape = true; return; }
+    if (c == '*' || c == '`') {
+        r->md_inline[0] = c;
+        r->md_inline_len = 1;
         return;
     }
     renderer_write_char_raw(r, c);
 }
 
 static void renderer_markdown_finish(agent_token_renderer *r) {
+    renderer_markdown_inline_flush(r, true);
     /* A closing code fence can be the final bytes of the assistant reply.  In
      * that case no following character arrives to force the pending backticks
      * through the normal streaming path, so commit a full fence here instead of
@@ -10220,43 +10261,46 @@ static void build_footer_text(const agent_status *st, const agent_prompt_queue *
     }
 
     const char *queued = agent_prompt_queue_peek(queue);
-    if (cols < 40) cols = 40;
+    if (cols < 1) cols = 1;
     int max_rows = 3;
     size_t budget = (size_t)cols * (size_t)max_rows;
     const char *plain_suffix = " (ctrl+x to edit, ESC to send ASAP)";
-    size_t queued_len = strlen(queued);
-    char more_suffix[160];
-    const char *suffix = plain_suffix;
-    size_t take = queued_len;
-    if (queued_len + strlen(plain_suffix) > budget) {
-        size_t reserve = 72;
-        take = budget > reserve ? budget - reserve : budget / 2;
-        snprintf(more_suffix, sizeof(more_suffix),
-                 "... %zu characters more ..., (ctrl+x to edit, ESC to send ASAP)",
-                 queued_len - take);
-        suffix = more_suffix;
-    }
-
+    size_t queued_len = strlen(queued), pos = 0, cells = 8;
+    size_t reserve = strlen(plain_suffix) + 4;
+    size_t preview_bytes = len > 1024 ? len - 1024 : 0;
     agent_buf msg = {0};
     agent_buf_puts(&msg, "queued: ");
-    for (size_t i = 0; i < take; i++) {
-        char c = queued[i];
-        if (c == '\n' || c == '\r' || c == '\t') c = ' ';
-        agent_buf_append(&msg, &c, 1);
+    while (pos < queued_len) {
+        int width;
+        size_t n = linenoiseNextGrapheme(queued + pos, queued_len - pos, &width);
+        if (!n) break;
+        bool control = (unsigned char)queued[pos] < 32 || queued[pos] == 127;
+        if (control) width = 1;
+        if (cells + (size_t)width + reserve > budget || msg.len + n > preview_bytes) break;
+        agent_buf_append(&msg, control ? " " : queued + pos, control ? 1 : n);
+        cells += (size_t)width;
+        pos += n;
     }
-    agent_buf_puts(&msg, suffix);
+    if (pos < queued_len) agent_buf_puts(&msg, "...");
+    agent_buf_puts(&msg, plain_suffix);
     char *preview = agent_buf_take(&msg);
 
     agent_buf out = {0};
-    size_t pos = 0, preview_len = strlen(preview);
+    pos = 0;
+    size_t preview_len = strlen(preview);
     for (int row = 0; row < max_rows && pos < preview_len; row++) {
         if (row) agent_buf_puts(&out, "\n");
         if (stdout_is_tty()) agent_buf_puts(&out, AGENT_QUEUE_STYLE);
-        size_t part = preview_len - pos;
-        if (part > (size_t)cols) part = (size_t)cols;
-        agent_buf_append(&out, preview + pos, part);
+        cells = 0;
+        while (pos < preview_len) {
+            int width;
+            size_t n = linenoiseNextGrapheme(preview + pos, preview_len - pos, &width);
+            if (!n || cells + (size_t)width > (size_t)cols) break;
+            agent_buf_append(&out, preview + pos, n);
+            cells += (size_t)width;
+            pos += n;
+        }
         if (stdout_is_tty()) agent_buf_puts(&out, "\x1b[0m");
-        pos += part;
     }
     agent_buf_puts(&out, "\n");
     if (stdout_is_tty()) agent_buf_puts(&out, AGENT_STATUS_STYLE_START);
@@ -10271,10 +10315,17 @@ typedef struct {
     char *input;
     char prompt[160];
     char status[4096];
+    bool prompt_dirty, status_dirty;
     int old_stdin_flags;
     bool active;
     bool hidden;
     bool output_line_open;
+    bool output_pending_wrap;
+    char output_utf8[4];
+    size_t output_utf8_len;
+    int output_escape;
+    bool output_zwj, output_regional;
+    int output_glyph_width;
     bool prompt_below_output;
     int output_col;
     bool scroll_region;
@@ -10460,52 +10511,74 @@ static void editor_replace_input(agent_editor *ed, const char *text) {
     if (text && text[0]) linenoiseEditInsert(&ed->edit, text, strlen(text));
 }
 
-/* Fallback cursor tracking for terminals that do not answer CPR quickly.  It is
- * intentionally approximate for wide Unicode; the CPR path handles exact
- * positioning in normal interactive terminals. */
+/* Track streamed text with the same widths as linenoise. Partial UTF-8 and
+ * escape sequences remain pending across worker-output chunks. */
 static void editor_note_output(agent_editor *ed, const char *text, size_t len) {
     int cols = ed->edit.cols > 0 ? (int)ed->edit.cols : 80;
     for (size_t i = 0; i < len; i++) {
-        size_t start = i;
         unsigned char c = (unsigned char)text[i];
-        if (c == 0x1b && i + 1 < len && text[i + 1] == '[') {
-            (void)start;
-            i += 2;
-            while (i < len) {
-                unsigned char e = (unsigned char)text[i];
-                if (e >= 0x40 && e <= 0x7e) break;
-                i++;
+        if (ed->output_escape) {
+            if (ed->output_escape == 1) ed->output_escape = c == '[' ? 2 : 0;
+            else if (c >= 0x40 && c <= 0x7e) ed->output_escape = 0;
+            continue;
+        }
+        if (c == 0x1b && !ed->output_utf8_len) { ed->output_escape = 1; continue; }
+        uint32_t cp = c;
+        if (ed->output_utf8_len || c >= 0x80) {
+            if (ed->output_utf8_len && (c & 0xc0) != 0x80) {
+                ed->output_utf8_len = 0;
+                ed->output_col = (ed->output_col + 1) % cols;
             }
-            continue;
+            ed->output_utf8[ed->output_utf8_len++] = (char)c;
+            size_t n = linenoiseUtf8Decode(ed->output_utf8, ed->output_utf8_len, &cp);
+            if (!n) continue;
+            ed->output_utf8_len = 0;
         }
-        if (c == '\n') {
+        if (cp == '\n' || cp == '\r') {
             ed->output_col = 0;
-            ed->output_line_open = false;
+            ed->output_pending_wrap = false;
+            if (cp == '\n') ed->output_line_open = false;
+            ed->output_zwj = ed->output_regional = false;
+            ed->output_glyph_width = 0;
             continue;
         }
-        if (c == '\r') {
-            ed->output_col = 0;
+        if (cp == '\b') {
+            if (ed->output_pending_wrap) ed->output_col = cols - 1;
+            else if (ed->output_col > 0) ed->output_col--;
+            ed->output_pending_wrap = false;
             continue;
         }
-        if (c == '\b') {
-            if (ed->output_col > 0) ed->output_col--;
+        if (cp == '\t') {
+            int col = ed->output_pending_wrap ? cols - 1 : ed->output_col;
+            ed->output_col = (col | 7) + 1;
+            if (ed->output_col >= cols) ed->output_col = cols - 1;
+            ed->output_pending_wrap = false;
+            ed->output_line_open = true;
             continue;
         }
-
-        int width = 1;
-        if (c == '\t') {
-            width = 8 - (ed->output_col & 7);
-        } else if (c < 0x20 || c == 0x7f) {
-            width = 0;
-        } else if (c >= 0xc0) {
-            while (i + 1 < len && (((unsigned char)text[i + 1]) & 0xc0) == 0x80)
-                i++;
-        } else if ((c & 0xc0) == 0x80) {
-            width = 0;
+        int width = linenoiseCharacterWidth(cp);
+        bool regional = cp >= 0x1f1e6 && cp <= 0x1f1ff;
+        if (cp == 0x200d) {
+            ed->output_zwj = true;
+            continue;
         }
-
+        if (cp == 0xfe0f && ed->output_glyph_width == 1) {
+            width = 1;
+            ed->output_glyph_width = 2;
+        } else if (width) {
+            if (ed->output_zwj || (regional && ed->output_regional)) {
+                width = 0;
+                ed->output_zwj = false;
+                ed->output_regional = false;
+            } else {
+                ed->output_glyph_width = width;
+                ed->output_regional = regional;
+            }
+        }
         if (width > 0) {
+            if (ed->output_col + width > cols) ed->output_col = 0;
             ed->output_col = (ed->output_col + width) % cols;
+            ed->output_pending_wrap = ed->output_col == 0;
             ed->output_line_open = true;
         }
     }
@@ -10848,6 +10921,11 @@ static int editor_start(agent_editor *ed, const char *prompt,
     ed->output_line_open = false;
     ed->prompt_below_output = false;
     ed->output_col = 0;
+    ed->output_pending_wrap = false;
+    ed->output_utf8_len = 0;
+    ed->output_escape = 0;
+    ed->output_zwj = ed->output_regional = false;
+    ed->output_glyph_width = 0;
     ed->cpr_len = 0;
     ed->paste_open = false;
     ed->paste_start_pending = false;
@@ -10875,6 +10953,11 @@ static void editor_stop(agent_editor *ed) {
     ed->output_line_open = false;
     ed->prompt_below_output = false;
     ed->output_col = 0;
+    ed->output_pending_wrap = false;
+    ed->output_utf8_len = 0;
+    ed->output_escape = 0;
+    ed->output_zwj = ed->output_regional = false;
+    ed->output_glyph_width = 0;
     ed->cpr_len = 0;
     ed->paste_open = false;
     ed->paste_start_pending = false;
@@ -10925,16 +11008,20 @@ static void editor_show(agent_editor *ed) {
      * colored parameter. */
     write_all(STDOUT_FILENO, "\x1b[0m", 4);
     linenoiseShow(&ed->edit);
+    ed->prompt_dirty = ed->status_dirty = false;
+    ed->last_prompt_redraw_time = now_sec();
     ed->hidden = false;
 }
 
 static void editor_update_prompt(agent_editor *ed, const char *prompt) {
+    if (strcmp(ed->prompt, prompt)) ed->prompt_dirty = true;
     snprintf(ed->prompt, sizeof(ed->prompt), "%s", prompt);
     ed->edit.prompt = ed->prompt;
     ed->edit.plen = strlen(ed->prompt);
 }
 
 static void editor_update_status(agent_editor *ed, const char *status) {
+    if (strcmp(ed->status, status ? status : "")) ed->status_dirty = true;
     snprintf(ed->status, sizeof(ed->status), "%s", status ? status : "");
     bool embedded_status = agent_footer_is_multiline(ed->status);
     const char *status_start = stdout_is_tty() && !embedded_status ?
@@ -10945,29 +11032,16 @@ static void editor_update_status(agent_editor *ed, const char *status) {
                            status_start, status_end);
 }
 
-static void editor_set_prompt_status(agent_editor *ed, const char *prompt,
-                                     const char *status) {
-    bool prompt_changed = strcmp(ed->prompt, prompt) != 0;
-    bool status_changed = strcmp(ed->status, status ? status : "") != 0;
-    if (!ed->active || (!prompt_changed && !status_changed)) return;
-    if (ed->hidden) {
-        if (prompt_changed) editor_update_prompt(ed, prompt);
-        if (status_changed) editor_update_status(ed, status);
-        return;
-    }
-    editor_hide(ed);
-    if (prompt_changed) editor_update_prompt(ed, prompt);
-    if (status_changed) editor_update_status(ed, status);
-    editor_show(ed);
-}
-
 static void editor_redraw_visible_prompt(agent_editor *ed) {
     if (!ed->active || !ed->scroll_region) return;
+    linenoiseBeginUpdate(STDOUT_FILENO);
     editor_clear_prompt_region(ed);
     editor_move_to_prompt_row(ed);
     write_all(STDOUT_FILENO, "\x1b[0m", 4);
     linenoiseShow(&ed->edit);
+    ed->prompt_dirty = ed->status_dirty = false;
     ed->last_prompt_redraw_time = now_sec();
+    linenoiseEndUpdate();
 }
 
 static bool editor_prompt_redraw_due(agent_editor *ed) {
@@ -10980,25 +11054,66 @@ static bool editor_prompt_redraw_due(agent_editor *ed) {
     return false;
 }
 
+static void editor_flush_prompt_status(agent_editor *ed, bool force) {
+    if (!ed->active || ed->hidden) return;
+    int rows, cols;
+    if (ed->scroll_region && editor_get_terminal_size(&rows, &cols) &&
+        (rows != ed->term_rows || cols != ed->term_cols)) {
+        ed->edit.cols = cols;
+        ed->prompt_dirty = true;
+        force = true;
+    }
+    if (!ed->prompt_dirty && !ed->status_dirty) return;
+    if (!force && !editor_prompt_redraw_due(ed)) return;
+    linenoiseBeginUpdate(STDOUT_FILENO);
+    if (ed->scroll_region) {
+        if (ed->prompt_dirty || !linenoiseRefreshStatus(&ed->edit))
+            editor_redraw_visible_prompt(ed);
+    } else {
+        editor_hide(ed);
+        editor_show(ed);
+    }
+    ed->prompt_dirty = ed->status_dirty = false;
+    ed->last_prompt_redraw_time = now_sec();
+    linenoiseEndUpdate();
+}
+
+static void editor_set_prompt_status(agent_editor *ed, const char *prompt,
+                                     const char *status) {
+    if (strcmp(ed->prompt, prompt)) editor_update_prompt(ed, prompt);
+    if (strcmp(ed->status, status ? status : "")) editor_update_status(ed, status);
+    editor_flush_prompt_status(ed, false);
+}
+
 static bool editor_write_scroll_output_preserve_prompt(agent_editor *ed,
                                                        const char *text,
                                                        size_t len,
                                                        bool settle_boundary) {
-    static const char sync_start[] = "\x1b[?2026h";
-    static const char sync_end[] = "\x1b[?2026l";
     agent_input_buf_append(&ed->deferred_output, text, len);
     if (!ed->deferred_output.len) return false;
 
     agent_editor predicted = *ed;
     editor_note_output(&predicted, ed->deferred_output.ptr,
                        ed->deferred_output.len);
-    bool at_boundary = predicted.output_line_open && predicted.output_col == 0;
+    if ((predicted.output_utf8_len || predicted.output_escape) && settle_boundary) {
+        if (predicted.output_utf8_len) {
+            ed->deferred_output.len -= predicted.output_utf8_len;
+            agent_input_buf_append(&ed->deferred_output, "\xef\xbf\xbd", 3);
+        } else {
+            while (ed->deferred_output.len &&
+                   ed->deferred_output.ptr[--ed->deferred_output.len] != 0x1b) {}
+        }
+        predicted = *ed;
+        editor_note_output(&predicted, ed->deferred_output.ptr, ed->deferred_output.len);
+    }
+    bool at_boundary = predicted.output_pending_wrap;
+    if (predicted.output_utf8_len || predicted.output_escape) return false;
     /* DECSC/DECRC does not reliably preserve pending auto-wrap.  Keep a chunk
      * that ends at the margin until the next content can trigger the wrap in
      * the same terminal write. */
     if (at_boundary && !settle_boundary) return false;
 
-    write_all(STDOUT_FILENO, sync_start, sizeof(sync_start) - 1);
+    linenoiseBeginUpdate(STDOUT_FILENO);
     editor_restore_output_cursor(ed);
     editor_write_terminal_text(ed->deferred_output.ptr,
                                ed->deferred_output.len);
@@ -11010,12 +11125,13 @@ static bool editor_write_scroll_output_preserve_prompt(agent_editor *ed,
         write_all(STDOUT_FILENO, "\r\n", 2);
         ed->output_col = 0;
         ed->output_line_open = false;
+        ed->output_pending_wrap = false;
     }
     agent_input_buf_free(&ed->deferred_output);
     editor_save_output_cursor(ed);
     write_all(STDOUT_FILENO, "\x1b[0m", 4);
     editor_move_to_prompt_cursor(ed);
-    write_all(STDOUT_FILENO, sync_end, sizeof(sync_end) - 1);
+    linenoiseEndUpdate();
     ed->output_at_scroll_boundary = true;
     return true;
 }
@@ -11064,6 +11180,9 @@ static void test_agent_terminal_wrap_output_is_deferred(void) {
     AGENT_TEST_ASSERT(ed.output_col == 0);
     AGENT_TEST_ASSERT(!ed.output_line_open);
 
+    AGENT_TEST_ASSERT(!editor_write_scroll_output_preserve_prompt(&ed, "\xe4", 1, false));
+    AGENT_TEST_ASSERT(editor_write_scroll_output_preserve_prompt(&ed, NULL, 0, true));
+    AGENT_TEST_ASSERT(ed.deferred_output.len == 0 && ed.output_utf8_len == 0);
     AGENT_TEST_ASSERT(dup2(saved_stdout, STDOUT_FILENO) >= 0);
     close(saved_stdout);
     fclose(sink);
@@ -11080,17 +11199,16 @@ static void editor_write_async(agent_editor *ed, const char *text, size_t len,
                                bool force_show) {
     if (ed->scroll_region && ed->active && !ed->hidden &&
         (len || ed->deferred_output.len)) {
+        editor_flush_prompt_status(ed, false);
         bool prompt_changed = strcmp(ed->prompt, prompt) != 0;
         bool status_changed = strcmp(ed->status, status ? status : "") != 0;
 
+        linenoiseBeginUpdate(STDOUT_FILENO);
         editor_write_scroll_output_preserve_prompt(ed, text, len, force_show);
         if (prompt_changed) editor_update_prompt(ed, prompt);
         if (status_changed) editor_update_status(ed, status);
-        if ((force_show || editor_prompt_redraw_due(ed)) &&
-            (prompt_changed || status_changed))
-        {
-            editor_redraw_visible_prompt(ed);
-        }
+        editor_flush_prompt_status(ed, force_show);
+        linenoiseEndUpdate();
         return;
     }
 
@@ -11665,6 +11783,8 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             editor_write_async(&editor, out, out_len, prompt, statusline, force_show);
         } else {
             editor_set_prompt_status(&editor, prompt, statusline);
+            editor_flush_prompt_status(&editor, st.state == AGENT_WORKER_IDLE ||
+                                       st.state == AGENT_WORKER_ERROR || st.state == AGENT_WORKER_STOPPED);
             if (editor.hidden && (st.state == AGENT_WORKER_IDLE ||
                                   st.state == AGENT_WORKER_ERROR ||
                                   st.state == AGENT_WORKER_STOPPED))
