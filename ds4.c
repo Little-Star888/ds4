@@ -38867,6 +38867,13 @@ static void ds4_engine_print_startup_memory(
             resident_model_bytes = active_model_bytes;
         }
     }
+    if (e->ssd_streaming && e->backend == DS4_BACKEND_METAL) {
+        uint64_t static_bytes = 0;
+        if (weights_streaming_non_routed_bytes(&e->weights, &static_bytes) &&
+            static_bytes > resident_model_bytes) {
+            resident_model_bytes = static_bytes;
+        }
+    }
 #endif
     uint64_t total = kv_bytes;
     total = ds4_add_sat_u64(total, mem.scratch_bytes);
@@ -63547,6 +63554,57 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
         ds4_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);
+#if defined(__APPLE__)
+        /* Keep the weights used by every token from competing with streamed
+         * experts in the file cache. These bytes are already in the model
+         * budget; munmap in model_close releases the locks. */
+        if (e->ssd_streaming && !load_slice && !tp_shard &&
+            getenv("DS4_METAL_DISABLE_STREAMING_STATIC_LOCK") == NULL) {
+            ds4_model_map_span_vec spans;
+            uint64_t static_bytes = 0;
+            const uint64_t budget = ds4_streaming_manual_cache_safe_bytes(
+                    e->backend, opt->context_size, e->prefill_chunk, true);
+            const uint64_t experts = ds4_add_sat_u64(
+                    ds4_engine_dynamic_expert_cache_bytes(e),
+                    ds4_add_sat_u64(e->ssd_streaming_prefill_headroom_bytes,
+                                   e->ssd_streaming_full_layer_bytes));
+            const bool fits =
+                weights_streaming_non_routed_bytes(&e->weights, &static_bytes) &&
+                static_bytes <= budget && experts <= budget - static_bytes;
+            if (!fits) {
+                fprintf(stderr, "ds4: Metal SSD static weights remain pageable"
+                        " to preserve runtime headroom\n");
+            } else if (weights_model_map_decode_static_spans(
+                        &e->weights, true, true, &spans)) {
+                uint64_t locked = 0, failed = 0;
+                bool can_lock = true;
+                const size_t page = (size_t)getpagesize();
+                for (uint32_t i = 0; i < spans.len; i++) {
+                    const uint64_t lo = spans.v[i].off / page * page;
+                    const uint64_t hi = spans.v[i].end;
+                    if (hi > e->model.size || hi <= lo) continue;
+                    /* Bound each VM operation, including very large heads. */
+                    for (uint64_t off = lo; off < hi;) {
+                        uint64_t len = hi - off;
+                        if (len > 256ull * 1024 * 1024)
+                            len = 256ull * 1024 * 1024;
+                        if (can_lock &&
+                            mlock(e->model.map + off, (size_t)len) == 0) {
+                            locked += len;
+                        } else {
+                            can_lock = false;
+                            failed += len;
+                        }
+                        off += len;
+                    }
+                }
+                fprintf(stderr, "ds4: Metal SSD static weights locked %.2f GiB"
+                        "; pageable %.2f GiB\n", locked / 1073741824.0,
+                        failed / 1073741824.0);
+                free(spans.v);
+            }
+        }
+#endif
         if (e->ssd_streaming) {
             /*
              * Pin the expert cache's slab size class to the model's uniform
