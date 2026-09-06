@@ -32,6 +32,11 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <copyfile.h>
+#elif defined(__linux__)
+#include <sys/xattr.h>
+#endif
 
 /* This is intentionally not in linenoise.h, but it is part of the existing
  * multiplexed editor implementation.  The agent uses it only to restore text
@@ -42,6 +47,9 @@ static int set_nonblock(int fd, bool on, int *old_flags);
 static bool agent_parse_bool_default(const char *s, bool def);
 static int agent_read_file_bytes(const char *path, char **data, size_t *len,
                                  char *err, size_t errlen);
+static int agent_replace_file(const char *path, const char *data, size_t len,
+                              const char *expected, size_t expected_len,
+                              char *err, size_t errlen);
 
 /* ============================================================================
  * Configuration, Worker State, And Streaming Types
@@ -160,6 +168,8 @@ typedef struct {
     int last_system_prompt_reminder_at;
     char more_path[PATH_MAX];
     int more_next_line;
+    off_t more_byte_offset;
+    bool more_mid_line;
     bool more_bare;
     bool more_valid;
     agent_bash_job *bash_jobs;
@@ -957,6 +967,15 @@ static ds4_think_mode effective_think_mode(const agent_config *cfg) {
  * ============================================================================
  */
 
+#define AGENT_TOOL_CONTRACTS \
+    "Read output is limited to 128 KiB. Use more to continue, including within an oversized line; " \
+    "whole=true fails rather than returning an excerpt. raw=true omits line numbers but still reports truncation.\n" \
+    "Search mode is literal (default) or regex (POSIX extended). Defaults: path=., case_sensitive=true, context=0, max_results=50. " \
+    "context is 0-5, max_results is 1-500. The search skips .git and nested symlinks, and reports incomplete coverage.\n" \
+    "bash timeout_sec defaults to 3600; refresh_sec defaults to 60 and waits up to that many seconds. " \
+    "bash_status returns immediately unless refresh_sec is given. Jobs keep running and timeouts remain active between calls.\n" \
+    "Write and edit replace complete files atomically, follow existing symlink targets, and reject hard-linked files.\n\n"
+
 static const char agent_tools_prompt_intro[] =
     "You are a coding agent running in a local workspace. Use tools for local file and system work. "
     "Avoid printing large file contents or large code blocks as answers; create or edit files with tools, "
@@ -970,12 +989,15 @@ static const char agent_tools_prompt_intro[] =
     "</｜DSML｜tool_calls>\n\n"
     "Tool calls are not allowed inside <think></think>; finish thinking before emitting DSML.\n\n"
     "String parameters use raw text and string=\"true\". Numbers and booleans use JSON text and string=\"false\".\n\n"
+    "Inside string values only, escape a literal closing parameter tag as &lt;/｜DSML｜parameter>. "
+    "To write that escaped spelling literally, use &amp;lt;/｜DSML｜parameter>. Other HTML entities are unchanged.\n\n"
     "Read defaults to a context-sized bounded chunk, not the whole file. "
     "For first looks at large files, prefer read with explicit max_lines around 80-160; "
     "if read says more lines are available, call more with count=<lines> to read the next chunk. "
-    "The read result also reports continue_offset=N, which is the next start_line if you need to jump manually. "
+    "Use more for exact continuation; a byte-limited chunk can end within a line. "
     "If the user explicitly asks you to read a complete file into context, call read with whole=true. "
-    "A whole-file read may fail if the result would not fit the current context; then explain that and use chunks.\n\n";
+    "A whole-file read may fail if the result would not fit the current context; then explain that and use chunks.\n\n"
+    AGENT_TOOL_CONTRACTS;
 
 #define AGENT_EDIT_TARGET_RULE \
     "When editing files, state the target filename before the edit; for the edit tool, put path first."
@@ -986,7 +1008,7 @@ static const char agent_tools_prompt_edit_exact[] =
     "Use edit with path, old, and new for changes. The old text must match exactly once in the current file; "
     "otherwise edit fails for safety. Read enough of the file to provide the exact old text being replaced.\n"
     "To insert text, use edit with old set to an exact unique anchor and new set to that anchor plus the added text.\n"
-    "Use read raw=true only when you need plain file text without line numbers or read annotations.\n\n";
+    "Use read raw=true only when you need plain file text without line numbers.\n\n";
 
 static const char agent_tools_prompt_edit_upto[] =
     "## Editing files\n\n"
@@ -1017,7 +1039,7 @@ static const char agent_tools_prompt_edit_upto[] =
     "</｜DSML｜invoke>\n"
     "</｜DSML｜tool_calls>\n"
     "To insert text, use edit with old set to an exact unique anchor and new set to that anchor plus the added text.\n"
-    "Use read raw=true only when you need plain file text without line numbers or read annotations.\n\n";
+    "Use read raw=true only when you need plain file text without line numbers.\n\n";
 
 static const char agent_tools_prompt_after_edit[] =
     "For long-running bash commands, pass refresh_sec. If a bash job is still running, use "
@@ -1062,8 +1084,8 @@ static const char agent_tools_prompt_after_edit[] =
     "      \"type\": \"object\",\n"
     "      \"properties\": {\n"
     "        \"command\": {\"type\": \"string\"},\n"
-    "        \"timeout_sec\": {\"type\": \"number\"},\n"
-    "        \"refresh_sec\": {\"type\": \"number\"}\n"
+    "        \"timeout_sec\": {\"type\": \"integer\"},\n"
+    "        \"refresh_sec\": {\"type\": \"integer\"}\n"
     "      },\n"
     "      \"required\": [\"command\"]\n"
     "    }\n"
@@ -1073,13 +1095,13 @@ static const char agent_tools_prompt_after_edit[] =
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
     "    \"name\": \"bash_status\",\n"
-    "    \"description\": \"Report current status and new output for a bash job.\",\n"
+    "    \"description\": \"Report current status and recent output for a bash job.\",\n"
     "    \"parameters\": {\n"
     "      \"type\": \"object\",\n"
     "      \"properties\": {\n"
-    "        \"job\": {\"type\": \"number\"},\n"
-    "        \"pid\": {\"type\": \"number\"},\n"
-    "        \"refresh_sec\": {\"type\": \"number\"}\n"
+    "        \"job\": {\"type\": \"integer\"},\n"
+    "        \"pid\": {\"type\": \"integer\"},\n"
+    "        \"refresh_sec\": {\"type\": \"integer\"}\n"
     "      },\n"
     "      \"required\": [\"job\"]\n"
     "    }\n"
@@ -1093,9 +1115,9 @@ static const char agent_tools_prompt_after_edit[] =
     "    \"parameters\": {\n"
     "      \"type\": \"object\",\n"
     "      \"properties\": {\n"
-    "        \"job\": {\"type\": \"number\"},\n"
-    "        \"pid\": {\"type\": \"number\"},\n"
-    "        \"refresh_sec\": {\"type\": \"number\"}\n"
+    "        \"job\": {\"type\": \"integer\"},\n"
+    "        \"pid\": {\"type\": \"integer\"},\n"
+    "        \"refresh_sec\": {\"type\": \"integer\"}\n"
     "      },\n"
     "      \"required\": [\"job\"]\n"
     "    }\n"
@@ -1110,8 +1132,8 @@ static const char agent_tools_prompt_after_edit[] =
     "      \"type\": \"object\",\n"
     "      \"properties\": {\n"
     "        \"path\": {\"type\": \"string\"},\n"
-    "        \"start_line\": {\"type\": \"number\"},\n"
-    "        \"max_lines\": {\"type\": \"number\"},\n"
+    "        \"start_line\": {\"type\": \"integer\"},\n"
+    "        \"max_lines\": {\"type\": \"integer\"},\n"
     "        \"whole\": {\"type\": \"boolean\"},\n"
     "        \"raw\": {\"type\": \"boolean\"}\n"
     "      },\n"
@@ -1122,26 +1144,12 @@ static const char agent_tools_prompt_after_edit[] =
     "{\n"
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
-    "    \"name\": \"view_image\",\n"
-    "    \"description\": \"Open a local PNG or JPEG as a visual observation.\",\n"
-    "    \"parameters\": {\n"
-    "      \"type\": \"object\",\n"
-    "      \"properties\": {\n"
-    "        \"path\": {\"type\": \"string\"}\n"
-    "      },\n"
-    "      \"required\": [\"path\"]\n"
-    "    }\n"
-    "  }\n"
-    "}\n\n"
-    "{\n"
-    "  \"type\": \"function\",\n"
-    "  \"function\": {\n"
     "    \"name\": \"more\",\n"
-    "    \"description\": \"Continue the previous read-like output.\",\n"
+    "    \"description\": \"Continue the previous read.\",\n"
     "    \"parameters\": {\n"
     "      \"type\": \"object\",\n"
     "      \"properties\": {\n"
-    "        \"count\": {\"type\": \"number\"}\n"
+    "        \"count\": {\"type\": \"integer\"}\n"
     "      }\n"
     "    }\n"
     "  }\n"
@@ -1187,10 +1195,10 @@ static const char agent_tools_prompt_after_edit[] =
     "      \"properties\": {\n"
     "        \"query\": {\"type\": \"string\"},\n"
     "        \"path\": {\"type\": \"string\"},\n"
-    "        \"mode\": {\"type\": \"string\"},\n"
+    "        \"mode\": {\"type\": \"string\", \"enum\": [\"literal\", \"regex\"]},\n"
     "        \"glob\": {\"type\": \"string\"},\n"
-    "        \"context\": {\"type\": \"number\"},\n"
-    "        \"max_results\": {\"type\": \"number\"},\n"
+    "        \"context\": {\"type\": \"integer\"},\n"
+    "        \"max_results\": {\"type\": \"integer\"},\n"
     "        \"case_sensitive\": {\"type\": \"boolean\"}\n"
     "      },\n"
     "      \"required\": [\"query\"]\n"
@@ -1222,16 +1230,25 @@ static const char agent_tools_prompt_after_edit[] =
     "- Work in a way that preserves the current system configuration integrity, "
     "unless explicitly asked otherwise by the user.\n";
 
-static char *agent_build_dsml_tools_prompt(bool edit_upto) {
+static const char agent_vision_tool_schema[] =
+    "{\"name\":\"view_image\",\"description\":\"Open a local PNG or JPEG as a visual observation.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}";
+
+static char *agent_build_dsml_tools_prompt(bool edit_upto, bool vision) {
     const char *edit = edit_upto ? agent_tools_prompt_edit_upto
                                  : agent_tools_prompt_edit_exact;
     size_t a = strlen(agent_tools_prompt_intro);
     size_t b = strlen(edit);
     size_t c = strlen(agent_tools_prompt_after_edit);
-    char *out = xmalloc(a + b + c + 1);
+    const char *vision_start = "\n{\"type\":\"function\",\"function\":";
+    size_t v = vision ? strlen(vision_start) + strlen(agent_vision_tool_schema) + 2 : 0;
+    char *out = xmalloc(a + b + c + v + 1);
     memcpy(out, agent_tools_prompt_intro, a);
     memcpy(out + a, edit, b);
-    memcpy(out + a + b, agent_tools_prompt_after_edit, c + 1);
+    const char *rules = strstr(agent_tools_prompt_after_edit, "\n# Rules\n");
+    size_t schemas = (size_t)(rules - agent_tools_prompt_after_edit);
+    memcpy(out + a + b, agent_tools_prompt_after_edit, schemas);
+    if (vision) snprintf(out + a + b + schemas, v + 1, "%s%s}\n", vision_start, agent_vision_tool_schema);
+    memcpy(out + a + b + schemas + v, rules, c - schemas + 1);
     return out;
 }
 
@@ -1246,6 +1263,9 @@ static const char agent_glm_tools_prompt_intro[] =
 
 static const char agent_glm_tools_prompt_after_schemas[] =
     "</tools>\n\n"
+    AGENT_TOOL_CONTRACTS
+    "Inside argument values only, escape a literal </arg_value> as &lt;/arg_value>. "
+    "To write that escaped spelling literally, use &amp;lt;/arg_value>. Other HTML entities are unchanged.\n\n"
     "For a function call, output the function name and arguments within exactly this XML format:\n"
     "<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>"
     "<arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>\n\n"
@@ -1270,30 +1290,31 @@ static const char agent_glm_tools_prompt_rules_tail[] =
 static const char agent_glm_tool_schemas[] =
     "{\"name\":\"google_search\",\"description\":\"Search web pages.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}},\"required\":[\"query\"]}}\n"
     "{\"name\":\"visit_page\",\"description\":\"Read a URL in browser.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"}},\"required\":[\"url\"]}}\n"
-    "{\"name\":\"bash\",\"description\":\"Run a shell command.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"timeout_sec\":{\"type\":\"number\"},\"refresh_sec\":{\"type\":\"number\"}},\"required\":[\"command\"]}}\n"
-    "{\"name\":\"bash_status\",\"description\":\"Check a bash job.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"job\":{\"type\":\"number\"},\"pid\":{\"type\":\"number\"},\"refresh_sec\":{\"type\":\"number\"}},\"required\":[\"job\"]}}\n"
-    "{\"name\":\"bash_stop\",\"description\":\"Stop a bash job.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"job\":{\"type\":\"number\"},\"pid\":{\"type\":\"number\"},\"refresh_sec\":{\"type\":\"number\"}},\"required\":[\"job\"]}}\n"
-    "{\"name\":\"read\",\"description\":\"Read a text file/range.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"start_line\":{\"type\":\"number\"},\"max_lines\":{\"type\":\"number\"},\"whole\":{\"type\":\"boolean\"},\"raw\":{\"type\":\"boolean\"}},\"required\":[\"path\"]}}\n"
-    "{\"name\":\"view_image\",\"description\":\"Open a local PNG or JPEG as a visual observation.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}\n"
-    "{\"name\":\"more\",\"description\":\"Continue previous read-like output.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"count\":{\"type\":\"number\"}}}}\n"
+    "{\"name\":\"bash\",\"description\":\"Run a shell command.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"timeout_sec\":{\"type\":\"integer\"},\"refresh_sec\":{\"type\":\"integer\"}},\"required\":[\"command\"]}}\n"
+    "{\"name\":\"bash_status\",\"description\":\"Check a bash job.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"job\":{\"type\":\"integer\"},\"pid\":{\"type\":\"integer\"},\"refresh_sec\":{\"type\":\"integer\"}},\"required\":[\"job\"]}}\n"
+    "{\"name\":\"bash_stop\",\"description\":\"Stop a bash job.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"job\":{\"type\":\"integer\"},\"pid\":{\"type\":\"integer\"},\"refresh_sec\":{\"type\":\"integer\"}},\"required\":[\"job\"]}}\n"
+    "{\"name\":\"read\",\"description\":\"Read a text file/range.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"start_line\":{\"type\":\"integer\"},\"max_lines\":{\"type\":\"integer\"},\"whole\":{\"type\":\"boolean\"},\"raw\":{\"type\":\"boolean\"}},\"required\":[\"path\"]}}\n"
+    "{\"name\":\"more\",\"description\":\"Continue previous read-like output.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"count\":{\"type\":\"integer\"}}}}\n"
     "{\"name\":\"write\",\"description\":\"Create or overwrite a file.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}}\n"
     "{\"name\":\"edit\",\"description\":\"Replace one exact old text match.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"old\":{\"type\":\"string\"},\"new\":{\"type\":\"string\"}},\"required\":[\"path\",\"old\",\"new\"]}}\n"
-    "{\"name\":\"search\",\"description\":\"Search files.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"mode\":{\"type\":\"string\"},\"glob\":{\"type\":\"string\"},\"context\":{\"type\":\"number\"},\"max_results\":{\"type\":\"number\"},\"case_sensitive\":{\"type\":\"boolean\"}},\"required\":[\"query\"]}}\n"
+    "{\"name\":\"search\",\"description\":\"Search files.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"mode\":{\"type\":\"string\",\"enum\":[\"literal\",\"regex\"]},\"glob\":{\"type\":\"string\"},\"context\":{\"type\":\"integer\"},\"max_results\":{\"type\":\"integer\"},\"case_sensitive\":{\"type\":\"boolean\"}},\"required\":[\"query\"]}}\n"
     "{\"name\":\"list\",\"description\":\"List one directory.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}\n";
 
-static char *agent_build_glm_tools_prompt(bool edit_upto) {
+static char *agent_build_glm_tools_prompt(bool edit_upto, bool vision) {
     size_t schemas_len = strlen(agent_glm_tool_schemas);
     const char *schemas = agent_glm_tool_schemas;
     const char *edit = edit_upto ? agent_glm_tools_prompt_edit_upto
                                  : agent_glm_tools_prompt_edit_exact;
     size_t a = strlen(agent_glm_tools_prompt_intro);
-    size_t b = schemas_len;
+    size_t v = vision ? strlen(agent_vision_tool_schema) + 1 : 0;
+    size_t b = schemas_len + v;
     size_t c = strlen(agent_glm_tools_prompt_after_schemas);
     size_t d = strlen(edit);
     size_t e = strlen(agent_glm_tools_prompt_rules_tail);
     char *out = xmalloc(a + b + c + d + e + 1);
     memcpy(out, agent_glm_tools_prompt_intro, a);
-    memcpy(out + a, schemas, b);
+    memcpy(out + a, schemas, schemas_len);
+    if (vision) snprintf(out + a + schemas_len, v + 1, "%s\n", agent_vision_tool_schema);
     memcpy(out + a + b, agent_glm_tools_prompt_after_schemas, c);
     memcpy(out + a + b + c, edit, d);
     memcpy(out + a + b + c + d, agent_glm_tools_prompt_rules_tail, e + 1);
@@ -1302,8 +1323,8 @@ static char *agent_build_glm_tools_prompt(bool edit_upto) {
 
 static char *agent_build_tools_prompt(ds4_engine *engine, bool edit_upto) {
     if (agent_tool_syntax_for_engine(engine) == AGENT_TOOL_SYNTAX_GLM)
-        return agent_build_glm_tools_prompt(edit_upto);
-    return agent_build_dsml_tools_prompt(edit_upto);
+        return agent_build_glm_tools_prompt(edit_upto, ds4_engine_has_vision(engine));
+    return agent_build_dsml_tools_prompt(edit_upto, ds4_engine_has_vision(engine));
 }
 
 static const char agent_dsml_syntax_reminder[] =
@@ -4177,14 +4198,18 @@ typedef struct {
     char *ptr;
     size_t len;
     size_t cap;
+    size_t limit;
     bool truncated;
 } agent_buf;
 
+#define AGENT_TOOL_MAX_BYTES (128 * 1024)
+
 static void agent_buf_append(agent_buf *b, const char *s, size_t n) {
     if (!n || b->truncated) return;
-    const size_t max = 128 * 1024;
-    if (b->len + n > max) {
+    const size_t max = b->limit ? b->limit : SIZE_MAX - 1;
+    if (n > max - b->len) {
         n = max > b->len ? max - b->len : 0;
+        while (n && ((unsigned char)s[n] & 0xc0) == 0x80) n--;
         b->truncated = true;
     }
     if (!n) return;
@@ -4204,6 +4229,11 @@ static void agent_buf_puts(agent_buf *b, const char *s) {
 }
 
 static char *agent_buf_take(agent_buf *b) {
+    if (b->truncated) {
+        b->truncated = false;
+        b->limit = 0;
+        agent_buf_puts(b, "\n[Output truncated at the tool byte limit. Narrow the request.]\n");
+    }
     if (!b->ptr) return xstrdup("");
     char *p = b->ptr;
     memset(b, 0, sizeof(*b));
@@ -6223,9 +6253,25 @@ static void agent_split_lines(const char *data, size_t len, agent_line_spans *sp
     }
 }
 
+static FILE *agent_open_regular_file(const char *path) {
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return NULL;
+    struct stat st;
+    int rc = fstat(fd, &st);
+    if (rc != 0 || !S_ISREG(st.st_mode)) {
+        int saved = rc != 0 ? errno : EINVAL;
+        close(fd);
+        errno = saved;
+        return NULL;
+    }
+    FILE *fp = fdopen(fd, "rb");
+    if (!fp) { int saved = errno; close(fd); errno = saved; }
+    return fp;
+}
+
 static int agent_read_file_bytes(const char *path, char **data, size_t *len,
                                  char *err, size_t errlen) {
-    FILE *fp = fopen(path, "rb");
+    FILE *fp = agent_open_regular_file(path);
     if (!fp) {
         snprintf(err, errlen, "open %s: %s", path, strerror(errno));
         return -1;
@@ -6310,7 +6356,7 @@ static char *agent_edit_result(const char *path,
                                        int start_line, int end_line, int delta,
                                        const char *new_data, size_t new_len,
                                        const char *kind) {
-    agent_buf b = {0};
+    agent_buf b = {.limit = AGENT_TOOL_MAX_BYTES};
     char msg[PATH_MAX + 180];
     snprintf(msg, sizeof(msg), "Edited %s using %s\n", path, kind);
     agent_buf_puts(&b, msg);
@@ -6337,10 +6383,13 @@ static char *agent_edit_result(const char *path,
 
 static void agent_worker_set_more(agent_worker *w, const char *path,
                                   int next_line, bool bare) {
-    snprintf(w->more_path, sizeof(w->more_path), "%s", path ? path : "");
+    if (path != w->more_path)
+        snprintf(w->more_path, sizeof(w->more_path), "%s", path ? path : "");
     w->more_next_line = next_line;
     w->more_bare = bare;
     w->more_valid = path && path[0] && next_line > 0;
+    w->more_byte_offset = 0;
+    w->more_mid_line = false;
 }
 
 static int agent_tool_result_reserve_tokens(agent_worker *w) {
@@ -6366,78 +6415,117 @@ static int agent_read_default_lines(agent_worker *w) {
 /* Read file text for the model.  Normal mode shows plain line numbers.  Raw
  * mode is reserved for cases where line decoration would corrupt the payload
  * being inspected. */
+static char *agent_read_range_from(agent_worker *w, const char *path, int start_line,
+                              int max_lines, bool whole_file, bool bare,
+                              bool set_more, off_t offset, bool mid_line) {
+    if (!path || !path[0]) return xstrdup("Tool error: read requires path\n");
+    agent_buf out = {0}, body = {0};
+    FILE *fp = agent_open_regular_file(path);
+    if (!fp) goto failed;
+    struct stat st;
+    if (fstat(fileno(fp), &st) != 0) goto failed;
+    if (!S_ISREG(st.st_mode)) { errno = EINVAL; goto failed; }
+    if (start_line < 1) start_line = 1;
+    if (max_lines <= 0) max_lines = agent_read_default_lines(w);
+    int c, line = 1, lines = 0;
+    if (offset > 0) {
+        if (fseeko(fp, offset, SEEK_SET) != 0) goto failed;
+        line = start_line;
+    }
+    while (line < start_line && (c = fgetc(fp)) != EOF) {
+        if (c == '\r') {
+            int next = fgetc(fp);
+            if (next != '\n' && next != EOF) ungetc(next, fp);
+        }
+        if (c == '\n' || c == '\r') line++;
+    }
+    bool beginning = !mid_line, prefix = true;
+    int last_line = 0;
+    while ((whole_file || lines < max_lines) && (c = fgetc(fp)) != EOF) {
+        if (body.len >= AGENT_TOOL_MAX_BYTES - 4096 &&
+            ((c & 0xc0) != 0x80 || body.len >= AGENT_TOOL_MAX_BYTES - 4096 + 3)) {
+            ungetc(c, fp);
+            break;
+        }
+        if (!c) {
+            agent_buf_puts(&out, "Tool error: read encountered binary data\n");
+            goto done;
+        }
+        last_line = line;
+        if (prefix && !bare) {
+            char label[80];
+            snprintf(label, sizeof(label), "%d%s ", line, beginning ? "" : " (continued)");
+            agent_buf_puts(&body, label);
+        }
+        prefix = false;
+        beginning = false;
+        char ch = (char)c;
+        if (c == '\r') {
+            int next = fgetc(fp);
+            if (bare) agent_buf_append(&body, &ch, 1);
+            if (next == '\n') {
+                ch = '\n';
+            } else {
+                if (next != EOF) ungetc(next, fp);
+                if (bare) ch = 0;
+                else ch = '\n';
+            }
+        }
+        if (ch) agent_buf_append(&body, &ch, 1);
+        if (c == '\n' || c == '\r') {
+            if (line == INT_MAX) { errno = EOVERFLOW; goto failed; }
+            line++;
+            lines++;
+            beginning = prefix = true;
+        }
+    }
+    if (ferror(fp)) goto failed;
+    off_t next_offset = ftello(fp);
+    if (next_offset < 0) goto failed;
+    c = fgetc(fp);
+    bool more = c != EOF;
+    if (ferror(fp)) goto failed;
+    if (whole_file && more) {
+        agent_buf_puts(&out, "Tool error: whole read exceeds the 128 KiB output limit; use read and more for chunks\n");
+        goto done;
+    }
+    if (!bare) {
+        char header[PATH_MAX + 128];
+        snprintf(header, sizeof(header), "%s: lines %d-%d%s\n", path,
+                 last_line ? start_line : 0, last_line, more ? " (partial read)" : " (end of file)");
+        agent_buf_puts(&out, header);
+    }
+    agent_buf_append(&out, body.ptr, body.len);
+    if (more) {
+        char note[256];
+        snprintf(note, sizeof(note), "\n[Read truncated. continue_offset=%d; continue_byte_offset=%lld%s. Call more to continue.]\n",
+                 line, (long long)next_offset, beginning ? "" : " (within line)");
+        agent_buf_puts(&out, note);
+    }
+    if (set_more) {
+        agent_worker_set_more(w, more ? path : NULL, more ? line : 0, bare);
+        w->more_byte_offset = next_offset;
+        w->more_mid_line = !beginning;
+    }
+    free(body.ptr);
+    fclose(fp);
+    return agent_buf_take(&out);
+failed:
+    agent_buf_puts(&out, "Tool error: read failed: ");
+    agent_buf_puts(&out, strerror(errno));
+    agent_buf_puts(&out, "\n");
+done:
+    if (fp) fclose(fp);
+    free(body.ptr);
+    if (set_more) agent_worker_set_more(w, NULL, 0, false);
+    return agent_buf_take(&out);
+}
+
 static char *agent_read_range(agent_worker *w, const char *path, int start_line,
                               int max_lines, bool whole_file, bool bare,
                               bool set_more) {
-    char err[256];
-    char *data = NULL;
-    size_t len = 0;
-    if (!path || !path[0]) return xstrdup("Tool error: read requires path\n");
-    if (agent_read_file_bytes(path, &data, &len, err, sizeof(err)) != 0) {
-        agent_buf b = {0};
-        agent_buf_puts(&b, "Tool error: ");
-        agent_buf_puts(&b, err);
-        agent_buf_puts(&b, "\n");
-        return agent_buf_take(&b);
-    }
-
-    agent_line_spans spans = {0};
-    agent_split_lines(data, len, &spans);
-    if (start_line < 1) start_line = 1;
-    int start_idx = start_line - 1;
-    if (start_idx > spans.len) start_idx = spans.len;
-    if (whole_file) {
-        max_lines = spans.len - start_idx;
-    } else {
-        if (max_lines <= 0) max_lines = agent_read_default_lines(w);
-    }
-    int end_idx = start_idx + max_lines;
-    if (end_idx > spans.len) end_idx = spans.len;
-
-    agent_buf out = {0};
-    if (bare) {
-        size_t start = start_idx < spans.len ? spans.v[start_idx].start : len;
-        size_t end = end_idx > start_idx ? spans.v[end_idx - 1].end : start;
-        agent_buf_append(&out, data + start, end - start);
-        if (end > start && out.ptr[out.len - 1] != '\n') agent_buf_puts(&out, "\n");
-        if (end_idx < spans.len) {
-            char note[160];
-            snprintf(note, sizeof(note),
-                     "[Read truncated at line %d of %d. continue_offset=%d. "
-                     "Call more with count=%d to read the next chunk.]\n",
-                     end_idx, spans.len, end_idx + 1,
-                     max_lines > 0 ? max_lines : agent_read_default_lines(w));
-            agent_buf_puts(&out, note);
-        }
-    } else {
-        char hdr[PATH_MAX + 160];
-        if (end_idx < spans.len) {
-            snprintf(hdr, sizeof(hdr),
-                     "%s: lines %d-%d of %d; continue_offset=%d; "
-                     "call more with count=%d to read the next chunk\n",
-                     path, spans.len ? start_idx + 1 : 0, end_idx, spans.len,
-                     end_idx + 1, max_lines > 0 ? max_lines : agent_read_default_lines(w));
-        } else {
-            snprintf(hdr, sizeof(hdr), "%s: lines %d-%d of %d\n",
-                     path, spans.len ? start_idx + 1 : 0, end_idx, spans.len);
-        }
-        agent_buf_puts(&out, hdr);
-        for (int i = start_idx; i < end_idx; i++) {
-            agent_line_span sp = spans.v[i];
-            char prefix[64];
-            snprintf(prefix, sizeof(prefix), "%d ", i + 1);
-            agent_buf_puts(&out, prefix);
-            agent_buf_append(&out, data + sp.start, sp.content_end - sp.start);
-            agent_buf_puts(&out, "\n");
-        }
-    }
-    if (set_more) {
-        if (end_idx < spans.len) agent_worker_set_more(w, path, end_idx + 1, bare);
-        else agent_worker_set_more(w, NULL, 0, false);
-    }
-    agent_line_spans_free(&spans);
-    free(data);
-    return agent_buf_take(&out);
+    return agent_read_range_from(w, path, start_line, max_lines, whole_file,
+                                 bare, set_more, 0, false);
 }
 
 static char *agent_tool_read(agent_worker *w, const agent_tool_call *call) {
@@ -6455,8 +6543,8 @@ static char *agent_tool_more(agent_worker *w, const agent_tool_call *call) {
     int count = agent_parse_int_default(agent_tool_arg_value(call, "count"),
                                         agent_read_default_lines(w), 1, INT_MAX);
     if (!w->more_valid) return xstrdup("Tool error: no previous output to continue\n");
-    return agent_read_range(w, w->more_path, w->more_next_line, count, false,
-                            w->more_bare, true);
+    return agent_read_range_from(w, w->more_path, w->more_next_line, count, false,
+                                 w->more_bare, true, w->more_byte_offset, w->more_mid_line);
 }
 
 static char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
@@ -6465,21 +6553,12 @@ static char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
     const char *content = agent_tool_arg_value(call, "content");
     if (!path || !path[0]) return xstrdup("Tool error: write requires path\n");
     if (!content) return xstrdup("Tool error: write requires content\n");
-    FILE *fp = fopen(path, "wb");
-    if (!fp) {
-        agent_buf b = {0};
-        agent_buf_puts(&b, "Tool error: open for write failed: ");
-        agent_buf_puts(&b, strerror(errno));
-        agent_buf_puts(&b, "\n");
-        return agent_buf_take(&b);
-    }
     size_t len = strlen(content);
-    size_t wr = fwrite(content, 1, len, fp);
-    int close_rc = fclose(fp);
-    if (wr != len || close_rc != 0) {
+    char err[256];
+    if (agent_replace_file(path, content, len, NULL, 0, err, sizeof(err)) != 0) {
         agent_buf b = {0};
-        agent_buf_puts(&b, "Tool error: write failed: ");
-        agent_buf_puts(&b, strerror(errno));
+        agent_buf_puts(&b, "Tool error: ");
+        agent_buf_puts(&b, err);
         agent_buf_puts(&b, "\n");
         return agent_buf_take(&b);
     }
@@ -6499,7 +6578,7 @@ static char *agent_tool_list(const agent_tool_call *call) {
         agent_buf_puts(&b, "\n");
         return agent_buf_take(&b);
     }
-    agent_buf out = {0};
+    agent_buf out = {.limit = AGENT_TOOL_MAX_BYTES};
     char hdr[PATH_MAX + 64];
     snprintf(hdr, sizeof(hdr), "%s:\n", path);
     agent_buf_puts(&out, hdr);
@@ -6530,24 +6609,152 @@ static char *agent_tool_list(const agent_tool_call *call) {
  * ============================================================================
  */
 
-static int agent_write_file_bytes(const char *path, const char *data, size_t len,
-                                  char *err, size_t errlen) {
-    FILE *fp = fopen(path, "wb");
-    if (!fp) {
-        snprintf(err, errlen, "open %s: %s", path, strerror(errno));
-        return -1;
+static bool agent_same_file_version(const struct stat *a, const struct stat *b) {
+#ifdef __APPLE__
+    struct timespec am = a->st_mtimespec, bm = b->st_mtimespec;
+    struct timespec ac = a->st_ctimespec, bc = b->st_ctimespec;
+#else
+    struct timespec am = a->st_mtim, bm = b->st_mtim;
+    struct timespec ac = a->st_ctim, bc = b->st_ctim;
+#endif
+    return a->st_dev == b->st_dev && a->st_ino == b->st_ino &&
+           a->st_size == b->st_size && a->st_nlink == b->st_nlink &&
+           am.tv_sec == bm.tv_sec && am.tv_nsec == bm.tv_nsec &&
+           ac.tv_sec == bc.tv_sec && ac.tv_nsec == bc.tv_nsec;
+}
+
+#ifdef __linux__
+/* Linux stores ACLs as xattrs too. A metadata copy failure must abort the
+ * replacement, not silently remove access rules from the edited file. */
+static int agent_copy_file_xattrs(int src, int dst) {
+    if (fremovexattr(dst, "system.posix_acl_access") != 0 &&
+        errno != ENODATA && errno != ENOTSUP) return -1;
+    ssize_t count = flistxattr(src, NULL, 0);
+    if (count < 0) return errno == ENOTSUP ? 0 : -1;
+    if (!count) return 0;
+    char *names = xmalloc((size_t)count);
+    count = flistxattr(src, names, (size_t)count);
+    int rc = -1, saved_errno;
+    if (count < 0) goto done;
+    for (ssize_t pos = 0; pos < count;) {
+        const char *name = names + pos;
+        ssize_t len = fgetxattr(src, name, NULL, 0);
+        if (len < 0) goto done;
+        void *value = xmalloc(len ? (size_t)len : 1);
+        ssize_t readlen = fgetxattr(src, name, value, (size_t)len);
+        int copied = readlen < 0 ? -1 : fsetxattr(dst, name, value, (size_t)readlen, 0);
+        int saved_errno = errno;
+        free(value);
+        errno = saved_errno;
+        if (copied != 0) goto done;
+        pos += (ssize_t)strlen(name) + 1;
     }
-    size_t wr = fwrite(data, 1, len, fp);
-    if (wr != len) {
-        snprintf(err, errlen, "write %s: %s", path, strerror(errno));
-        fclose(fp);
-        return -1;
+    rc = 0;
+done:
+    saved_errno = errno;
+    free(names);
+    errno = saved_errno;
+    return rc;
+}
+#endif
+
+/* Commit only complete files. Follow existing symlinks, but refuse hard links:
+ * an atomic rename cannot preserve their shared-inode semantics. The version
+ * checks catch concurrent edits, though unrelated writers do not take a lock. */
+static int agent_replace_file(const char *path, const char *data, size_t len,
+                              const char *expected, size_t expected_len,
+                              char *err, size_t errlen) {
+    char target[PATH_MAX], temp[PATH_MAX] = "";
+    struct stat before, after;
+    int src = -1, fd = -1, rc = -1;
+    bool exists = lstat(path, &before) == 0;
+    if (!exists && errno != ENOENT) goto failed;
+    if (exists) {
+        if (!realpath(path, target)) goto failed;
+        src = open(target, O_RDWR | O_NONBLOCK | O_NOFOLLOW);
+        if (src < 0 || fstat(src, &before) != 0) goto failed;
+        if (!S_ISREG(before.st_mode) || before.st_nlink != 1) {
+            snprintf(err, errlen, "refusing to replace non-regular or hard-linked file: %s", path);
+            goto done;
+        }
+        if (expected) {
+            if (before.st_size < 0 || (uintmax_t)before.st_size != expected_len)
+                goto changed;
+            char buf[8192];
+            size_t pos = 0;
+            while (pos < expected_len) {
+                size_t count = expected_len - pos;
+                if (count > sizeof(buf)) count = sizeof(buf);
+                ssize_t n = read(src, buf, count);
+                if (n < 0 && errno == EINTR) continue;
+                if (n < 0) goto failed;
+                if (!n || memcmp(buf, expected + pos, (size_t)n)) goto changed;
+                pos += (size_t)n;
+            }
+        }
+    } else {
+        if (expected) goto changed;
+        if (snprintf(target, sizeof(target), "%s", path) >= (int)sizeof(target)) {
+            errno = ENAMETOOLONG;
+            goto failed;
+        }
     }
-    if (fclose(fp) != 0) {
-        snprintf(err, errlen, "close %s: %s", path, strerror(errno));
-        return -1;
+    if (snprintf(temp, sizeof(temp), "%s.ds4-XXXXXX", target) >= (int)sizeof(temp)) {
+        temp[0] = 0;
+        errno = ENAMETOOLONG;
+        goto failed;
     }
-    return 0;
+    fd = mkstemp(temp);
+    if (fd < 0) { temp[0] = 0; goto failed; }
+    if (!exists) {
+        /* Let open apply the process umask without changing it in this thread. */
+        if (unlink(temp) != 0) goto failed;
+        close(fd);
+        fd = open(temp, O_WRONLY | O_CREAT | O_EXCL, 0666);
+        if (fd < 0) { temp[0] = 0; goto failed; }
+    }
+    for (size_t pos = 0; pos < len;) {
+        ssize_t n = write(fd, data + pos, len - pos);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { if (!n) errno = EIO; goto failed; }
+        pos += (size_t)n;
+    }
+    if (exists) {
+        if (fchown(fd, before.st_uid, before.st_gid) != 0) goto failed;
+        if (fchmod(fd, before.st_mode & 07777) != 0) goto failed;
+#ifdef __APPLE__
+        if (fcopyfile(src, fd, NULL, COPYFILE_ACL | COPYFILE_XATTR) != 0) goto failed;
+#elif defined(__linux__)
+        if (agent_copy_file_xattrs(src, fd) != 0) goto failed;
+#endif
+    }
+    if (fsync(fd) != 0) goto failed;
+    if (close(fd) != 0) { fd = -1; goto failed; }
+    fd = -1;
+    if (exists) {
+        char resolved[PATH_MAX];
+        if (!realpath(path, resolved) || strcmp(resolved, target) ||
+            stat(target, &after) != 0 || !agent_same_file_version(&before, &after))
+            goto changed;
+        if (rename(temp, target) != 0) goto failed;
+    } else {
+        /* Unlike rename, link will not overwrite a concurrently created file. */
+        if (link(temp, target) != 0) goto failed;
+        unlink(temp);
+    }
+    temp[0] = 0;
+    rc = 0;
+    goto done;
+changed:
+    snprintf(err, errlen, "file changed while editing; read it again: %s", path);
+    goto done;
+failed:
+    snprintf(err, errlen, "replace %s: %s", path, strerror(errno));
+done:
+    if (fd >= 0) close(fd);
+    if (src >= 0) close(src);
+    if (temp[0]) unlink(temp);
+    return rc;
 }
 
 static void agent_edit_result_append_line(agent_buf *b, const char *data,
@@ -6803,18 +7010,13 @@ static bool agent_edit_find_old_span(const char *data, size_t len,
     static const char marker[] = "[upto]";
     size_t old_len = strlen(old);
     const char *upto = strstr(old, marker);
-    if (!upto) {
+    if (!allow_upto || !upto) {
         *anchored = false;
         if (!agent_find_unique(data, len, old, old_len, match, "old text",
                                err, err_len))
             return false;
         *match_len = old_len;
         return true;
-    }
-    if (!allow_upto) {
-        snprintf(err, err_len,
-                 "[upto] edits are disabled; restart with --edit-upto to enable them");
-        return false;
     }
     if (strstr(upto + strlen(marker), marker)) {
         snprintf(err, err_len, "old text contains more than one [upto] marker");
@@ -6896,7 +7098,7 @@ static void test_agent_edit_upto_tail_newline_is_not_part_of_anchor(void) {
     AGENT_TEST_ASSERT(!agent_edit_find_old_span(data, strlen(data), old, false,
                                                &match, &match_len, &anchored,
                                                err, sizeof(err)));
-    AGENT_TEST_ASSERT(strstr(err, "--edit-upto") != NULL);
+    AGENT_TEST_ASSERT(strstr(err, "not found") != NULL);
     err[0] = '\0';
     AGENT_TEST_ASSERT(agent_edit_find_old_span(data, strlen(data), old, true,
                                               &match, &match_len, &anchored,
@@ -7230,10 +7432,10 @@ static void test_agent_glm_tool_parser_rejects_missing_value(void) {
 }
 
 static void test_agent_edit_upto_prompt_is_opt_in(void) {
-    char *dsml_default = agent_build_dsml_tools_prompt(false);
-    char *dsml_upto = agent_build_dsml_tools_prompt(true);
-    char *glm_default = agent_build_glm_tools_prompt(false);
-    char *glm_upto = agent_build_glm_tools_prompt(true);
+    char *dsml_default = agent_build_dsml_tools_prompt(false, false);
+    char *dsml_upto = agent_build_dsml_tools_prompt(true, false);
+    char *glm_default = agent_build_glm_tools_prompt(false, false);
+    char *glm_upto = agent_build_glm_tools_prompt(true, false);
 
     AGENT_TEST_ASSERT(strstr(dsml_default, "[upto]") == NULL);
     AGENT_TEST_ASSERT(strstr(dsml_upto, "[upto]") != NULL);
@@ -7247,7 +7449,7 @@ static void test_agent_edit_upto_prompt_is_opt_in(void) {
 }
 
 static void test_agent_glm_tools_prompt_is_native(void) {
-    char *prompt = agent_build_glm_tools_prompt(false);
+    char *prompt = agent_build_glm_tools_prompt(false, true);
 
     AGENT_TEST_ASSERT(strstr(prompt, "<tools>") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "<tool_call>") != NULL);
@@ -7422,7 +7624,7 @@ static char *agent_apply_file_splice(const char *path,
            len - offset - remove_len);
     out[out_len] = '\0';
 
-    int rc = agent_write_file_bytes(path, out, out_len, err, sizeof(err));
+    int rc = agent_replace_file(path, out, out_len, data, len, err, sizeof(err));
     if (rc != 0) {
         free(out);
         agent_buf b = {0};
@@ -7499,6 +7701,8 @@ typedef struct {
     int context;
     int max_results;
     int results;
+    size_t skipped;
+    char first_skip[PATH_MAX + 128];
     agent_buf out;
 } agent_search_ctx;
 
@@ -7537,79 +7741,137 @@ static bool agent_search_line_matches(agent_search_ctx *ctx, const char *s, size
 }
 
 static void agent_search_emit_line(agent_search_ctx *ctx, const char *data,
-                                   agent_line_span sp, int line_no) {
+                                   int line_no) {
     char prefix[64];
     snprintf(prefix, sizeof(prefix), "  %d ", line_no);
     agent_buf_puts(&ctx->out, prefix);
-    agent_buf_append(&ctx->out, data + sp.start, sp.content_end - sp.start);
+    agent_buf_puts(&ctx->out, data);
     agent_buf_puts(&ctx->out, "\n");
+}
+
+static void agent_search_skip(agent_search_ctx *ctx, const char *path, const char *why) {
+    ctx->skipped++;
+    if (!ctx->first_skip[0])
+        snprintf(ctx->first_skip, sizeof(ctx->first_skip), "%s: %s", path, why);
+}
+
+/* A file can be arbitrarily large; only the current line and a small context
+ * ring are resident. Oversized or binary lines are reported, never ignored. */
+static int agent_search_read_line(FILE *fp, char **text) {
+    agent_buf line = {0};
+    int c;
+    while ((c = fgetc(fp)) != EOF) {
+        if (!c || line.len == AGENT_TOOL_MAX_BYTES) {
+            free(line.ptr);
+            return -2;
+        }
+        if (c == '\n' || c == '\r') {
+            if (c == '\r') {
+                int next = fgetc(fp);
+                if (next != '\n' && next != EOF) ungetc(next, fp);
+            }
+            break;
+        }
+        char ch = (char)c;
+        agent_buf_append(&line, &ch, 1);
+    }
+    if (ferror(fp)) { free(line.ptr); return -1; }
+    if (c == EOF && !line.len) { free(line.ptr); return 0; }
+    *text = agent_buf_take(&line);
+    return 1;
 }
 
 /* Search one text file and emit matching lines with plain line numbers. */
 static void agent_search_file(agent_search_ctx *ctx, const char *path) {
-    if (ctx->results >= ctx->max_results) return;
+    if (ctx->results >= ctx->max_results || ctx->out.truncated) return;
     if (ctx->glob && ctx->glob[0]) {
         const char *base = strrchr(path, '/');
         base = base ? base + 1 : path;
         if (fnmatch(ctx->glob, base, 0) != 0 && fnmatch(ctx->glob, path, 0) != 0)
             return;
     }
-    char err[256];
-    char *data = NULL;
-    size_t len = 0;
-    if (agent_read_file_bytes(path, &data, &len, err, sizeof(err)) != 0) return;
-    if (memchr(data, '\0', len)) {
-        free(data);
-        return;
-    }
-    agent_line_spans spans = {0};
-    agent_split_lines(data, len, &spans);
+    FILE *fp = agent_open_regular_file(path);
+    if (!fp) { agent_search_skip(ctx, path, strerror(errno)); return; }
+    char *ring[6] = {0};
     bool printed_file = false;
-    int last_context_line = -1;
-    for (int i = 0; i < spans.len && ctx->results < ctx->max_results; i++) {
-        agent_line_span sp = spans.v[i];
-        if (!agent_search_line_matches(ctx, data + sp.start, sp.content_end - sp.start))
-            continue;
-        if (!printed_file) {
+    int line = 0, last_emitted = 0, after = 0;
+    while ((ctx->results < ctx->max_results || after) && !ctx->out.truncated) {
+        char *text = NULL;
+        int rc = agent_search_read_line(fp, &text);
+        if (!rc) break;
+        if (rc < 0) {
+            agent_search_skip(ctx, path, rc == -2 ? "binary data or line exceeds 128 KiB" : strerror(errno));
+            break;
+        }
+        if (line == INT_MAX) {
+            free(text);
+            agent_search_skip(ctx, path, "line number limit reached");
+            break;
+        }
+        line++;
+        free(ring[line % 6]);
+        ring[line % 6] = text;
+        bool match = ctx->results < ctx->max_results &&
+                     agent_search_line_matches(ctx, text, strlen(text));
+        if (match && !printed_file) {
             agent_buf_puts(&ctx->out, path);
             agent_buf_puts(&ctx->out, "\n");
             printed_file = true;
         }
-        int from = i - ctx->context;
-        int to = i + ctx->context;
-        if (from < 0) from = 0;
-        if (to >= spans.len) to = spans.len - 1;
-        if (from <= last_context_line) from = last_context_line + 1;
-        for (int j = from; j <= to; j++) {
-            agent_search_emit_line(ctx, data, spans.v[j], j + 1);
-            last_context_line = j;
+        if (match) {
+            int from = line - ctx->context;
+            if (from <= last_emitted) from = last_emitted + 1;
+            for (int j = from; j <= line; j++)
+                agent_search_emit_line(ctx, ring[j % 6], j);
+            last_emitted = line;
+            after = ctx->context;
+            ctx->results++;
+        } else if (after) {
+            agent_search_emit_line(ctx, text, line);
+            last_emitted = line;
+            after--;
         }
-        ctx->results++;
     }
     if (printed_file) agent_buf_puts(&ctx->out, "\n");
-    agent_line_spans_free(&spans);
-    free(data);
+    for (int i = 0; i < 6; i++) free(ring[i]);
+    fclose(fp);
 }
 
 /* Recursively search a file or directory, avoiding .git and stopping once the
  * result cap is reached. */
 static void agent_search_path(agent_search_ctx *ctx, const char *path, int depth) {
-    if (ctx->results >= ctx->max_results || depth > 24) return;
+    if (ctx->results >= ctx->max_results || ctx->out.truncated) return;
+    if (depth > 24) { agent_search_skip(ctx, path, "directory depth limit reached"); return; }
     struct stat st;
-    if (lstat(path, &st) != 0) return;
+    if ((depth == 0 ? stat(path, &st) : lstat(path, &st)) != 0) {
+        agent_search_skip(ctx, path, strerror(errno));
+        return;
+    }
     if (S_ISREG(st.st_mode)) {
         agent_search_file(ctx, path);
         return;
     }
-    if (!S_ISDIR(st.st_mode)) return;
+    if (!S_ISDIR(st.st_mode)) {
+        agent_search_skip(ctx, path, "not a regular file or directory (nested symlinks are not followed)");
+        return;
+    }
     DIR *dir = opendir(path);
-    if (!dir) return;
+    if (!dir) { agent_search_skip(ctx, path, strerror(errno)); return; }
     struct dirent *de;
-    while ((de = readdir(dir)) != NULL && ctx->results < ctx->max_results) {
+    while (ctx->results < ctx->max_results && !ctx->out.truncated) {
+        errno = 0;
+        de = readdir(dir);
+        if (!de) {
+            if (errno) agent_search_skip(ctx, path, strerror(errno));
+            break;
+        }
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
         if (!strcmp(de->d_name, ".git")) continue;
         char child[PATH_MAX];
-        snprintf(child, sizeof(child), "%s/%s", path, de->d_name);
+        if (snprintf(child, sizeof(child), "%s/%s", path, de->d_name) >= (int)sizeof(child)) {
+            agent_search_skip(ctx, path, "path exceeds PATH_MAX");
+            continue;
+        }
         agent_search_path(ctx, child, depth + 1);
     }
     closedir(dir);
@@ -7623,6 +7885,16 @@ static char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) path = ".";
     const char *mode = agent_tool_arg_value(call, "mode");
+    if (mode && strcmp(mode, "literal") && strcmp(mode, "regex"))
+        return xstrdup("Tool error: search mode must be literal or regex (POSIX extended)\n");
+    struct stat root;
+    if (stat(path, &root) != 0 || (!S_ISDIR(root.st_mode) && !S_ISREG(root.st_mode))) {
+        agent_buf error = {0};
+        agent_buf_puts(&error, "Tool error: search path is missing, unreadable, or not a regular file/directory: ");
+        agent_buf_puts(&error, path);
+        agent_buf_puts(&error, "\n");
+        return agent_buf_take(&error);
+    }
     agent_search_ctx ctx = {
         .query = query,
         .glob = agent_tool_arg_value(call, "glob"),
@@ -7630,6 +7902,7 @@ static char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
         .case_sensitive = agent_parse_bool_default(agent_tool_arg_value(call, "case_sensitive"), true),
         .context = agent_parse_int_default(agent_tool_arg_value(call, "context"), 0, 0, 5),
         .max_results = agent_parse_int_default(agent_tool_arg_value(call, "max_results"), 50, 1, 500),
+        .out = {.limit = AGENT_TOOL_MAX_BYTES},
     };
     if (ctx.use_regex) {
         int flags = REG_EXTENDED | REG_NOSUB;
@@ -7648,7 +7921,7 @@ static char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
     }
     agent_search_path(&ctx, path, 0);
     if (ctx.regex_ready) regfree(&ctx.regex);
-    if (!ctx.out.ptr) agent_buf_puts(&ctx.out, "No matches\n");
+    if (!ctx.out.ptr) agent_buf_puts(&ctx.out, "No matches in searched text\n");
     else {
         char hdr[96];
         snprintf(hdr, sizeof(hdr), "%d match%s shown\n\n",
@@ -7661,6 +7934,16 @@ static char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
         memmove(ctx.out.ptr + hdr_len, ctx.out.ptr, ctx.out.len + 1);
         memcpy(ctx.out.ptr, hdr, hdr_len);
         ctx.out.len += hdr_len;
+    }
+    ctx.out.limit = 0;
+    if (ctx.skipped || ctx.results >= ctx.max_results) {
+        bool truncated = ctx.out.truncated;
+        ctx.out.truncated = false;
+        char note[PATH_MAX + 256];
+        snprintf(note, sizeof(note), "\nSearch incomplete: %zu skipped paths%s. %s\n",
+                 ctx.skipped, ctx.results >= ctx.max_results ? "; match limit reached" : "", ctx.first_skip);
+        agent_buf_puts(&ctx.out, note);
+        ctx.out.truncated = truncated;
     }
     return agent_buf_take(&ctx.out);
 }
@@ -7818,8 +8101,7 @@ static char *agent_tool_visit_page(agent_worker *w, const agent_tool_call *call)
  * Bash commands are tracked jobs, not blocking one-shot calls.  Each job owns a
  * process, a pipe, and a secure /tmp output file.  The first observation is
  * head-biased so headers and early errors are visible; later progress updates
- * are tail-biased and report how much output was added since the previous
- * observation.
+ * are tail-biased and report the total captured output size.
  */
 
 #define AGENT_BASH_HEAD_BYTES (8*1024)
@@ -7829,23 +8111,28 @@ static char *agent_tool_visit_page(agent_worker *w, const agent_tool_call *call)
 #define AGENT_BASH_FINAL_TAIL_LINES 20
 
 struct agent_bash_job {
+    pthread_t thread;
+    pthread_mutex_t mu;
+    bool thread_started;
     int id;
     pid_t pid;
     int pipe_fd;
     int tmp_fd;
     char path[PATH_MAX];
-    char *cmd;
     double start_time;
+    double end_time;
+    double stop_deadline;
     double timeout_sec;
     size_t bytes;
     int newline_count;
     char last_byte;
-    size_t observed_bytes;
-    int observed_display_lines;
     bool observed_once;
     int exit_status;
     bool running;
     bool timed_out;
+    bool reaped, pipe_eof;
+    int child_status;
+    int output_error;
     struct agent_bash_job *next;
     agent_worker *worker;  /* back-pointer for terminal state restoration */
 };
@@ -7857,22 +8144,38 @@ static int agent_bash_display_lines(const agent_bash_job *job) {
 
 static void agent_bash_note_output(agent_bash_job *job, const char *s, size_t n) {
     for (size_t i = 0; i < n; i++) {
-        if (s[i] == '\n') job->newline_count++;
+        if (s[i] == '\n' && job->newline_count < INT_MAX - 1) job->newline_count++;
     }
     if (n) job->last_byte = s[n - 1];
     job->bytes += n;
 }
 
+static bool agent_bash_is_running(agent_bash_job *job) {
+    pthread_mutex_lock(&job->mu);
+    bool running = job->running;
+    pthread_mutex_unlock(&job->mu);
+    return running;
+}
+
+static void agent_bash_signal(agent_bash_job *job, int sig) {
+    pthread_mutex_lock(&job->mu);
+    if (job->running) {
+        if (sig == SIGKILL && !job->stop_deadline) job->stop_deadline = now_sec() + 1;
+        kill(-job->pid, sig);
+        if (!job->reaped) kill(job->pid, sig);
+    }
+    pthread_mutex_unlock(&job->mu);
+}
+
 static void agent_bash_job_free(agent_bash_job *job) {
     if (!job) return;
-    if (job->running && job->pid > 0) {
-        kill(-job->pid, SIGKILL);
-        kill(job->pid, SIGKILL);
-        waitpid(job->pid, NULL, 0);
-    }
+    agent_bash_signal(job, SIGKILL);
+    if (job->thread_started) pthread_join(job->thread, NULL);
+    else if (job->pid > 0)
+        while (waitpid(job->pid, NULL, 0) < 0 && errno == EINTR) {}
     if (job->pipe_fd >= 0) close(job->pipe_fd);
     if (job->tmp_fd >= 0) close(job->tmp_fd);
-    free(job->cmd);
+    pthread_mutex_destroy(&job->mu);
     free(job);
 }
 
@@ -7910,14 +8213,28 @@ static void agent_bash_remove_job(agent_worker *w, agent_bash_job *target) {
 static void agent_bash_drain(agent_bash_job *job) {
     if (!job || job->pipe_fd < 0) return;
     char tmp[4096];
-    for (;;) {
+    /* Yield even for an endless writer, so its deadline is still checked. */
+    for (size_t drained = 0; drained < 256 * 1024;) {
         ssize_t n = read(job->pipe_fd, tmp, sizeof(tmp));
         if (n > 0) {
-            agent_bash_note_output(job, tmp, (size_t)n);
-            if (job->tmp_fd >= 0) write_all(job->tmp_fd, tmp, (size_t)n);
+            drained += (size_t)n;
+            size_t pos = 0;
+            while (pos < (size_t)n) {
+                ssize_t wr = write(job->tmp_fd, tmp + pos, (size_t)n - pos);
+                if (wr < 0 && errno == EINTR) continue;
+                if (wr <= 0) {
+                    job->output_error = wr < 0 ? errno : EIO;
+                    return;
+                }
+                agent_bash_note_output(job, tmp + pos, (size_t)wr);
+                pos += (size_t)wr;
+            }
             continue;
         }
+        if (!n) job->pipe_eof = true;
         if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+            job->output_error = errno;
         break;
     }
 }
@@ -7943,28 +8260,29 @@ static void agent_bash_finalize(agent_bash_job *job, int status) {
     else if (WIFSIGNALED(status)) job->exit_status = 128 + WTERMSIG(status);
     else job->exit_status = -1;
     job->running = false;
+    job->end_time = now_sec();
     /* A child can still open /dev/tty directly and alter terminal state even
      * though its stdin is /dev/null.  Ask the UI thread to verify raw mode at
      * a safe point instead of touching linenoise from the worker path. */
     agent_worker_note_terminal_mode_may_have_changed(job->worker);
 }
 
-/* Drain available output, notice process exit, and enforce timeout.  This is
- * called opportunistically by status/wait/compaction instead of a background
- * reaper thread, keeping all bash job state owned by the agent worker. */
+/* The monitor owns the descriptors and child reaping. Tool observations take
+ * the job mutex; the model worker owns only the list and observation cursors. */
 static void agent_bash_poll(agent_bash_job *job) {
     if (!job || !job->running) return;
     agent_bash_drain(job);
 
     int status = 0;
-    pid_t rc = waitpid(job->pid, &status, WNOHANG);
+    pid_t rc = job->reaped ? 0 : waitpid(job->pid, &status, WNOHANG);
     if (rc == job->pid) {
-        agent_bash_finalize(job, status);
-        return;
+        job->reaped = true;
+        job->child_status = status;
     }
     if (rc < 0 && errno != EINTR) {
         job->exit_status = -1;
         job->running = false;
+        job->end_time = now_sec();
         if (job->pipe_fd >= 0) {
             close(job->pipe_fd);
             job->pipe_fd = -1;
@@ -7976,13 +8294,45 @@ static void agent_bash_poll(agent_bash_job *job) {
         agent_worker_note_terminal_mode_may_have_changed(job->worker);
         return;
     }
-    if (now_sec() - job->start_time >= job->timeout_sec) {
-        job->timed_out = true;
-        kill(-job->pid, SIGKILL);
-        kill(job->pid, SIGKILL);
-        while (waitpid(job->pid, &status, 0) < 0 && errno == EINTR) {}
-        agent_bash_finalize(job, status);
+    if (job->reaped && job->pipe_eof) {
+        agent_bash_finalize(job, job->child_status);
+        return;
     }
+    if (!job->timed_out && (job->output_error || now_sec() - job->start_time >= job->timeout_sec)) {
+        job->timed_out = !job->output_error;
+        kill(-job->pid, SIGKILL);
+        if (!job->reaped) {
+            kill(job->pid, SIGKILL);
+            while (waitpid(job->pid, &status, 0) < 0 && errno == EINTR) {}
+            job->reaped = true;
+            job->child_status = status;
+        }
+    }
+    if (job->output_error || (job->timed_out && now_sec() - job->start_time > job->timeout_sec + 1) ||
+        (job->stop_deadline && now_sec() >= job->stop_deadline)) {
+        /* A descendant can deliberately escape the shell process group. Do
+         * not let its inherited stdout prevent bounded job cleanup. */
+        if (!job->output_error && !job->pipe_eof) job->output_error = EIO;
+        agent_bash_finalize(job, job->child_status);
+    }
+}
+
+static void *agent_bash_monitor(void *arg) {
+    agent_bash_job *job = arg;
+    for (;;) {
+        pthread_mutex_lock(&job->mu);
+        agent_bash_poll(job);
+        bool running = job->running;
+        int fd = job->pipe_fd;
+        pthread_mutex_unlock(&job->mu);
+        if (!running) break;
+        struct pollfd pfd = {.fd = fd, .events = POLLIN};
+        int rc = poll(&pfd, 1, 50);
+        /* A closed stdout must not turn the deadline monitor into a busy loop. */
+        if (rc > 0 && (pfd.revents & POLLHUP) && !(pfd.revents & POLLIN))
+            usleep(50000);
+    }
+    return NULL;
 }
 
 /* Spawn a shell command into its own process group so bash_stop/timeout can
@@ -8003,6 +8353,9 @@ static agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
         unlink(tmp_path);
         return NULL;
     }
+    fcntl(tmpfd, F_SETFD, FD_CLOEXEC);
+    fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
+    fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
     pid_t pid = fork();
     if (pid < 0) {
         snprintf(err, err_len, "failed to fork: %s", strerror(errno));
@@ -8042,31 +8395,29 @@ static agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
 
     agent_bash_job *job = xmalloc(sizeof(*job));
     memset(job, 0, sizeof(*job));
+    pthread_mutex_init(&job->mu, NULL);
     if (w->next_bash_job_id <= 0) w->next_bash_job_id = 1;
     job->id = w->next_bash_job_id++;
     job->pid = pid;
     job->pipe_fd = pipefd[0];
     job->tmp_fd = tmpfd;
     snprintf(job->path, sizeof(job->path), "%s", tmp_path);
-    job->cmd = xstrdup(cmd);
     job->start_time = now_sec();
     job->timeout_sec = timeout_sec;
     job->exit_status = -1;
     job->running = true;
     job->worker = w;
+    int thread_rc = pthread_create(&job->thread, NULL, agent_bash_monitor, job);
+    if (thread_rc != 0) {
+        snprintf(err, err_len, "failed to monitor shell command: %s", strerror(thread_rc));
+        agent_bash_job_free(job);
+        unlink(tmp_path);
+        return NULL;
+    }
+    job->thread_started = true;
     job->next = w->bash_jobs;
     w->bash_jobs = job;
     return job;
-}
-
-static void agent_tail_append(agent_buf *b, const char *s, size_t n, size_t max) {
-    if (!n) return;
-    agent_buf_append(b, s, n);
-    if (b->len > max) {
-        size_t drop = b->len - max;
-        memmove(b->ptr, b->ptr + drop, b->len - drop + 1);
-        b->len -= drop;
-    }
 }
 
 /* Read the first max_lines from the output file, with a byte cap to avoid a
@@ -8082,7 +8433,8 @@ static char *agent_bash_read_head(const agent_bash_job *job, int max_lines,
 
     agent_buf out = {0};
     int lines = 0;
-    while (lines < max_lines && out.len < max_bytes) {
+    size_t available = job->bytes < max_bytes ? job->bytes : max_bytes;
+    while (lines < max_lines && out.len < available) {
         int c = fgetc(fp);
         if (c == EOF) {
             if (ferror(fp) && errno == EINTR) {
@@ -8095,7 +8447,7 @@ static char *agent_bash_read_head(const agent_bash_job *job, int max_lines,
         agent_buf_append(&out, &ch, 1);
         if (ch == '\n') lines++;
     }
-    if (out.len >= max_bytes && !feof(fp) && byte_limited) *byte_limited = true;
+    if (out.len >= max_bytes && out.len < job->bytes && byte_limited) *byte_limited = true;
     fclose(fp);
     if (lines_read) *lines_read = lines + (out.len && out.ptr[out.len - 1] != '\n');
     if (!out.ptr) return xstrdup("");
@@ -8110,11 +8462,19 @@ static char *agent_bash_read_tail_lines(const agent_bash_job *job, int max_lines
     if (!fp) return xstrdup("<failed to reopen output file>\n");
 
     agent_buf tail = {0};
+    size_t bytes = job->bytes;
+    size_t take = bytes < AGENT_BASH_TAIL_BYTES ? bytes : AGENT_BASH_TAIL_BYTES;
+    if (fseeko(fp, (off_t)(bytes - take), SEEK_SET) != 0) {
+        fclose(fp);
+        return xstrdup("<failed to seek output file>\n");
+    }
     char tmp[2048];
-    for (;;) {
-        size_t n = fread(tmp, 1, sizeof(tmp), fp);
-        if (n) agent_tail_append(&tail, tmp, n, AGENT_BASH_TAIL_BYTES);
-        if (n < sizeof(tmp)) {
+    while (take) {
+        size_t want = take < sizeof(tmp) ? take : sizeof(tmp);
+        size_t n = fread(tmp, 1, want, fp);
+        if (n) agent_buf_append(&tail, tmp, n);
+        take -= n;
+        if (n < want) {
             if (ferror(fp) && errno == EINTR) {
                 clearerr(fp);
                 continue;
@@ -8126,25 +8486,42 @@ static char *agent_bash_read_tail_lines(const agent_bash_job *job, int max_lines
     if (!tail.ptr) return xstrdup("");
 
     char *start = tail.ptr;
-    int newlines = 0;
+    int newlines = tail.ptr[tail.len - 1] == '\n' ? 0 : 1;
     for (char *p = tail.ptr + tail.len; p > tail.ptr; p--) {
         if (p[-1] == '\n' && ++newlines > max_lines) {
             start = p;
             break;
         }
     }
+    /* A byte-limited tail may begin inside a UTF-8 character. */
+    while (((unsigned char)*start & 0xc0) == 0x80) start++;
     char *out = xstrdup(start);
     free(tail.ptr);
     return out;
 }
 
-/* Build the tool result for a bash job.  mark_observed advances the per-job
- * cursor so the next status reports only fresh output. */
-static char *agent_bash_observation(agent_bash_job *job, bool mark_observed) {
-    agent_bash_poll(job);
+/* The first observation uses the head; subsequent ones use a bounded tail. */
+static char *agent_bash_observation(agent_bash_job *job, bool mark_observed, bool *done) {
+    pthread_mutex_lock(&job->mu);
+    agent_bash_job snapshot = {
+        .id = job->id, .pid = job->pid,
+        .start_time = job->start_time, .end_time = job->end_time,
+        .timeout_sec = job->timeout_sec, .bytes = job->bytes,
+        .newline_count = job->newline_count, .last_byte = job->last_byte,
+        .observed_once = job->observed_once, .exit_status = job->exit_status,
+        .running = job->running, .timed_out = job->timed_out,
+        .output_error = job->output_error,
+    };
+    memcpy(snapshot.path, job->path, sizeof(snapshot.path));
+    if (mark_observed) job->observed_once = true;
+    pthread_mutex_unlock(&job->mu);
+    /* Disk reads must not hold up the monitor's deadline checks. Only the
+     * immutable observation fields above are read from this local snapshot. */
+    job = &snapshot;
+    if (done) *done = !snapshot.running;
     bool first_observation = !job->observed_once;
     int display_lines = agent_bash_display_lines(job);
-    double elapsed = now_sec() - job->start_time;
+    double elapsed = (job->running ? now_sec() : job->end_time) - job->start_time;
 
     agent_buf out = {0};
     char line[PATH_MAX + 256];
@@ -8161,6 +8538,11 @@ static char *agent_bash_observation(agent_bash_job *job, bool mark_observed) {
     if (!job->running) {
         snprintf(line, sizeof(line), "exit_status=%d\n", job->exit_status);
         agent_buf_puts(&out, line);
+    }
+    if (job->output_error) {
+        agent_buf_puts(&out, "Tool error: command output could not be captured completely: ");
+        agent_buf_puts(&out, strerror(job->output_error));
+        agent_buf_puts(&out, "\n");
     }
 
     if (job->bytes == 0) {
@@ -8215,10 +8597,61 @@ static char *agent_bash_observation(agent_bash_job *job, bool mark_observed) {
         agent_buf_puts(&out, line);
     }
 
-    if (mark_observed) {
-        job->observed_bytes = job->bytes;
-        job->observed_display_lines = display_lines;
-        job->observed_once = true;
+    return agent_buf_take(&out);
+}
+
+/* Shell bytes are data, not instructions to our terminal. Keep only SGR color
+ * sequences; OSC, cursor motion, erasure and other controls stay in the log. */
+static char *agent_terminal_safe_text(const char *text, size_t len) {
+    agent_buf out = {0};
+    for (size_t i = 0; i < len;) {
+        unsigned char c = (unsigned char)text[i++];
+        if (c >= 0x80) {
+            uint32_t cp;
+            size_t n = linenoiseUtf8Decode(text + i - 1, len - i + 1, &cp);
+            if (n > 1 && !(cp >= 0x80 && cp <= 0x9f)) {
+                agent_buf_append(&out, text + i - 1, n);
+                i += n - 1;
+                continue;
+            }
+            char escaped[5];
+            snprintf(escaped, sizeof(escaped), "\\x%02x", c);
+            agent_buf_puts(&out, escaped);
+            continue;
+        }
+        if (c == 0x1b) {
+            size_t start = i - 1;
+            if (i == len) break;
+            char kind = text[i++];
+            if (kind == '[') {
+                bool sgr = true;
+                while (i < len && (unsigned char)text[i] < 0x40) {
+                    if (!isdigit((unsigned char)text[i]) && text[i] != ';' && text[i] != ':') sgr = false;
+                    i++;
+                }
+                if (i < len) {
+                    if (text[i] == 'm' && sgr && i - start < 96)
+                        agent_buf_append(&out, text + start, i - start + 1);
+                    i++;
+                }
+            } else if (kind == ']' || kind == 'P' || kind == '_' || kind == '^' || kind == 'X') {
+                while (i < len) {
+                    if (text[i++] == '\a' && kind == ']') break;
+                    if (i >= 2 && text[i - 2] == 0x1b && text[i - 1] == '\\') break;
+                }
+            } else {
+                while (kind >= 0x20 && kind <= 0x2f && i < len) kind = text[i++];
+            }
+            continue;
+        }
+        if ((c < 32 && c != '\n' && c != '\r' && c != '\t') || c == 127) {
+            char escaped[5];
+            snprintf(escaped, sizeof(escaped), "\\x%02x", c);
+            agent_buf_puts(&out, escaped);
+        } else {
+            char ch = (char)c;
+            agent_buf_append(&out, &ch, 1);
+        }
     }
     return agent_buf_take(&out);
 }
@@ -8260,49 +8693,41 @@ static void agent_bash_publish_observation(agent_worker *w, const char *obs) {
     if (n) {
         bool failed = strstr(obs, "status=done") && !strstr(obs, "exit_status=0\n");
         if (failed) agent_publish(w, "\x1b[38;5;208m", 11);
-        agent_publish(w, body, n);
-        if (body[n - 1] != '\n') agent_publish(w, "\n", 1);
-        if (failed) agent_publish(w, "\x1b[0m", 4);
+        char *safe = agent_terminal_safe_text(body, n);
+        agent_publish(w, safe, strlen(safe));
+        if (safe[0] && safe[strlen(safe) - 1] != '\n') agent_publish(w, "\n", 1);
+        agent_publish(w, "\x1b[0m", 4);
+        free(safe);
     }
 }
 
 static void agent_bash_refresh_for(agent_worker *w, agent_bash_job *job,
                                    int refresh_sec) {
     double start = now_sec();
-    while (job->running && now_sec() - start < refresh_sec) {
+    while (agent_bash_is_running(job) && now_sec() - start < refresh_sec) {
         if (worker_should_interrupt(w)) break;
-        agent_bash_poll(job);
-        if (!job->running) break;
-        struct pollfd pfd = {.fd = job->pipe_fd, .events = POLLIN};
-        poll(&pfd, 1, 100);
+        usleep(20000);
     }
-    agent_bash_poll(job);
 }
 
 /* Common implementation for bash, bash_status, and bash_stop. */
 static char *agent_bash_job_tool_result(agent_worker *w, agent_bash_job *job,
                                         bool wait, int refresh_sec,
                                         bool stop, bool remove_if_done) {
-    if (stop && job->running) {
-        kill(-job->pid, SIGTERM);
-        kill(job->pid, SIGTERM);
+    if (stop && agent_bash_is_running(job)) {
+        agent_bash_signal(job, SIGTERM);
         double start = now_sec();
-        while (job->running && now_sec() - start < 1.0) {
-            agent_bash_poll(job);
-            if (!job->running) break;
+        while (agent_bash_is_running(job) && now_sec() - start < 1.0) {
             usleep(20000);
         }
-        if (job->running) {
-            kill(-job->pid, SIGKILL);
-            kill(job->pid, SIGKILL);
-        }
+        agent_bash_signal(job, SIGKILL);
     }
     if (wait || stop) agent_bash_refresh_for(w, job, refresh_sec);
-    else agent_bash_poll(job);
 
-    char *obs = agent_bash_observation(job, true);
+    bool done = false;
+    char *obs = agent_bash_observation(job, true, &done);
     agent_bash_publish_observation(w, obs);
-    if (remove_if_done && !job->running) agent_bash_remove_job(w, job);
+    if (remove_if_done && done) agent_bash_remove_job(w, job);
     return obs;
 }
 
@@ -8452,9 +8877,10 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
             return xstrdup(msg);
         }
         int refresh = agent_parse_int_default(agent_tool_arg_value(call, "refresh_sec"),
-                                              60, 1, 3600);
+                                              0, 0, 3600);
         bool stop = !strcmp(call->name, "bash_stop");
-        bool wait = stop;
+        bool wait = stop || refresh > 0;
+        if (stop && refresh == 0) refresh = 1;
         return agent_bash_job_tool_result(w, job, wait, refresh, stop, true);
     }
 
@@ -8616,13 +9042,14 @@ static char *agent_bash_jobs_compaction_observation(agent_worker *w) {
         "Bash job update after context compaction. Running jobs still need explicit bash_status or bash_stop if relevant.\n");
     for (agent_bash_job *job = w->bash_jobs, *next = NULL; job; job = next) {
         next = job->next;
-        char *obs = agent_bash_observation(job, true);
+        bool done = false;
+        char *obs = agent_bash_observation(job, true, &done);
         char hdr[64];
         snprintf(hdr, sizeof(hdr), "\nJob %d:\n", job->id);
         agent_buf_puts(&out, hdr);
         agent_buf_puts(&out, obs);
         free(obs);
-        if (!job->running) agent_bash_remove_job(w, job);
+        if (done) agent_bash_remove_job(w, job);
     }
     return agent_buf_take(&out);
 }
