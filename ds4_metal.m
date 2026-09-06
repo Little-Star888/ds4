@@ -17520,12 +17520,8 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
 
             const int force_reuse =
                 cache_budget != 0 && reserved_entries >= cache_budget;
-            ds4_gpu_stream_expert_readahead_range(unique_gate_offsets[u],
-                                                  gate_expert_bytes);
-            ds4_gpu_stream_expert_readahead_range(unique_up_offsets[u],
-                                                  gate_expert_bytes);
-            ds4_gpu_stream_expert_readahead_range(unique_down_offsets[u],
-                                                  down_expert_bytes);
+            /* The worker pool reads this entire batch below. Serial read-ahead
+             * here waits for the same pages before parallel I/O can begin. */
             const double buffer_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
             const int prepared =
                 ds4_gpu_stream_expert_cache_prepare_load_buffers(layer,
