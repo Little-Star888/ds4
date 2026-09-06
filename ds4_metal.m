@@ -2079,6 +2079,17 @@ static void ds4_gpu_model_views_clear(void) {
     g_model_view_count = 0;
 }
 
+static void ds4_gpu_model_views_remove_map(const void *model_map) {
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < g_model_view_count; i++) {
+        if (g_model_views[i].model_map != model_map)
+            g_model_views[kept++] = g_model_views[i];
+    }
+    for (uint32_t i = kept; i < g_model_view_count; i++)
+        g_model_views[i] = (ds4_gpu_model_view){0};
+    g_model_view_count = kept;
+}
+
 static void ds4_gpu_model_residency_clear(void) {
 #if TARGET_OS_OSX
     if (@available(macOS 15.0, *)) {
@@ -4335,7 +4346,7 @@ void ds4_gpu_print_memory_report(const char *label) {
             ds4_gpu_mib(tensor_peak_snap));
     ds4_gpu_print_task_memory_report();
     fprintf(stderr,
-            "ds4:   mmap model wrapper spans %llu buffers %.2f GiB total, %.2f GiB max (not copied)\n",
+            "ds4:   mmap model wrapper creations %llu buffers %.2f GiB cumulative, %.2f GiB max (not copied)\n",
             (unsigned long long)g_model_wrap_count,
             ds4_gpu_gib(g_model_wrap_bytes),
             ds4_gpu_gib(g_model_wrap_max_bytes));
@@ -12639,7 +12650,7 @@ int ds4_gpu_set_model_map_spans(
         uint64_t max_tensor_bytes) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!model_map || model_size == 0 || !offsets || !sizes || count == 0) return 0;
-    if (count == 1) {
+    if (count == 1 && !g_ssd_streaming_mode) {
         return ds4_gpu_set_model_map_range(model_map,
                                            model_size,
                                            offsets[0],
@@ -12655,7 +12666,11 @@ int ds4_gpu_set_model_map_spans(
         max_tensor_bytes = ds4_gpu_effective_model_max_tensor_bytes(model_size, max_tensor_bytes);
 
         ds4_gpu_model_residency_clear();
-        ds4_gpu_model_views_clear();
+        /* Streaming changes the target's active layer, not the auxiliary
+         * vision/drafter models. Single spans need the same bounded lifetime
+         * as disjoint spans instead of accumulating every visited layer. */
+        if (g_ssd_streaming_mode) ds4_gpu_model_views_remove_map(model_map);
+        else ds4_gpu_model_views_clear();
 
         uint64_t mapped_total = 0;
         uint64_t first_offset = UINT64_MAX;

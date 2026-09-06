@@ -43169,6 +43169,13 @@ static bool glm_graph_warm_compact_indexer_store(
     if (!g->indexer_k) return false;
     if (warm_pos >= g->compact_cache_cap) warm_pos = g->compact_cache_cap - 1u;
 
+    /* Prefill leaves only the last layer/head mapped in streaming mode.
+     * Warmup reads indexer normalization weights from every indexer layer. */
+    if (g->ssd_streaming && !g->streaming_static_decode_map_current) {
+        if (!metal_graph_stream_map_decode_static_all(model, weights)) return false;
+        g->streaming_static_decode_map_current = true;
+    }
+
     if (ds4_gpu_tensor_fill_f32(g->indexer_k,
                                 0.0f,
                                 DS4_N_INDEXER_HEAD_DIM) == 0) {

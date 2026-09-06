@@ -20,6 +20,49 @@ static uint32_t random_u32(void) {
     return rng;
 }
 
+static int check_mapping_lifetime(void) {
+    const uint64_t page = getpagesize(), bytes = 4100 * page;
+    float *target = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANON, -1, 0);
+    float *aux = mmap(NULL, page, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (target == MAP_FAILED || aux == MAP_FAILED) {
+        if (target != MAP_FAILED) munmap(target, bytes);
+        if (aux != MAP_FAILED) munmap(aux, page);
+        return 0;
+    }
+    aux[0] = 3.25f;
+    target[0] = 2.0f;
+    target[(bytes - page) / sizeof(float)] = 4.25f;
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(sizeof(float));
+    const float input = 2.0f;
+    int ok = x && out && ds4_gpu_tensor_write(x, 0, &input, sizeof(input)) &&
+             ds4_gpu_set_model_map_range(aux, page, 0, page, sizeof(float));
+    /* More layer switches than the view table can retain. The auxiliary
+     * model must survive both single-span and disjoint target replacements. */
+    for (uint64_t i = 0; i < 4100 && ok; i++) {
+        const uint64_t offset = i * page;
+        ok = ds4_gpu_set_model_map_spans(target, bytes, &offset, &page, 1, sizeof(float));
+    }
+    float actual = NAN;
+    ok = ok && ds4_gpu_matmul_f32_tensor(out, target, bytes, bytes - page, 1, 1, x, 1) &&
+         ds4_gpu_tensor_read(out, 0, &actual, sizeof(actual)) && actual == 8.5f;
+    const uint64_t offsets[] = {0, 2 * page}, sizes[] = {page, page};
+    ok = ok && ds4_gpu_set_model_map_spans(target, bytes, offsets, sizes, 2, sizeof(float));
+    ok = ok && ds4_gpu_matmul_f32_tensor(out, target, bytes, 0, 1, 1, x, 1) &&
+         ds4_gpu_tensor_read(out, 0, &actual, sizeof(actual)) && actual == 4.0f;
+    ok = ok && ds4_gpu_matmul_f32_tensor(out, aux, page, 0, 1, 1, x, 1) &&
+         ds4_gpu_tensor_read(out, 0, &actual, sizeof(actual)) && actual == 6.5f;
+    ds4_gpu_tensor_free(x);
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_cleanup();
+    munmap(target, bytes);
+    munmap(aux, page);
+    fprintf(stderr, "Metal SSD bounded target views and auxiliary mapping: %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 int main(void) {
     const uint64_t row = sizeof(iq2_block);
     const uint64_t expert = H * row;
@@ -107,6 +150,7 @@ int main(void) {
     ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(up); ds4_gpu_tensor_free(mid);
     ds4_gpu_tensor_free(down); ds4_gpu_tensor_free(out);
     ds4_gpu_print_memory_report("SSD expert test");
+    if (ok) ok = check_mapping_lifetime();
     ds4_gpu_cleanup();
     munmap(model, bytes);
     fclose(file);
