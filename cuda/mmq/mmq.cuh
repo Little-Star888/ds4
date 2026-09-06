@@ -3750,7 +3750,6 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
                         tile_y[l] = by0[l];
                     }
                 } else {
-#pragma unroll
                     for (int l = linear_tid; l < valid_y_words; l += nthreads) {
                         tile_y[l] = by0[l];
                     }
@@ -3790,7 +3789,6 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
                         tile_y[l] = by0[l];
                     }
                 } else {
-#pragma unroll
                     for (int l = linear_tid; l < valid_y_words; l += nthreads) {
                         tile_y[l] = by0[l];
                     }
