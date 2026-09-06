@@ -725,6 +725,7 @@ static double g_stream_expert_cache_pread_ms;
 static uint64_t g_stream_expert_cache_buffer_allocs;
 static uint64_t g_stream_expert_cache_buffer_reuses;
 static uint64_t g_stream_expert_cache_decode_tokens;
+static uint32_t g_stream_expert_cache_first_decode_layer = UINT32_MAX;
 static uint64_t g_stream_expert_cache_hotness_decay_token;
 static uint64_t g_stream_expert_timing_selected_calls;
 static double g_stream_expert_timing_selected_read_ms;
@@ -4416,6 +4417,11 @@ void ds4_gpu_print_memory_report(const char *label) {
                     g_stream_expert_cache_mlock_ms);
         }
         if (ds4_gpu_stream_expert_timing_summary_enabled()) {
+            fprintf(stderr,
+                    "ds4:   streaming cache aging tokens=%llu first_layer=%u decay_token=%llu\n",
+                    (unsigned long long)g_stream_expert_cache_decode_tokens,
+                    g_stream_expert_cache_first_decode_layer,
+                    (unsigned long long)g_stream_expert_cache_hotness_decay_token);
             const ds4_gpu_stream_expert_timing_snapshot total =
                 ds4_gpu_stream_expert_timing_current();
             if (ds4_gpu_stream_expert_timing_has_data(total)) {
@@ -14288,19 +14294,15 @@ static void ds4_gpu_stream_expert_cache_note_frequency_hotness(
 }
 
 static void ds4_gpu_stream_expert_cache_note_token(uint32_t layer_index) {
-    if (!g_ssd_streaming_mode || layer_index != 0 ||
-        g_stream_expert_cache_decode_tokens == UINT64_MAX) {
-        return;
-    }
-    g_stream_expert_cache_decode_tokens++;
-    ds4_gpu_stream_expert_cache_maybe_decay_route_hotness();
-}
-
-static void ds4_gpu_stream_expert_cache_note_decode_token(void) {
     if (!g_ssd_streaming_mode ||
         g_stream_expert_cache_decode_tokens == UINT64_MAX) {
         return;
     }
+    /* GLM starts with dense layers; a pipeline slice may start even later.
+     * Typed and generic routed kernels must advance the same aging clock. */
+    if (layer_index < g_stream_expert_cache_first_decode_layer)
+        g_stream_expert_cache_first_decode_layer = layer_index;
+    if (layer_index != g_stream_expert_cache_first_decode_layer) return;
     g_stream_expert_cache_decode_tokens++;
     ds4_gpu_stream_expert_cache_maybe_decay_route_hotness();
 }
@@ -15164,6 +15166,7 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
         g_stream_expert_cache_buffer_allocs = 0;
         g_stream_expert_cache_buffer_reuses = 0;
         g_stream_expert_cache_decode_tokens = 0;
+        g_stream_expert_cache_first_decode_layer = UINT32_MAX;
         g_stream_expert_cache_hotness_decay_token = 0;
         memset(g_stream_expert_cache_route_hotness,
                0,
@@ -37726,9 +37729,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         fprintf(stderr, "ds4: Metal GLM routed MoE received inconsistent expert strides\n");
         return 0;
     }
-    if (layer_index == 3u) {
-        ds4_gpu_stream_expert_cache_note_decode_token();
-    }
+    ds4_gpu_stream_expert_cache_note_token(layer_index);
     if (gate_offset > model_size || gate_tensor_bytes > model_size - gate_offset ||
         up_offset > model_size || up_tensor_bytes > model_size - up_offset ||
         down_offset > model_size || down_tensor_bytes > model_size - down_offset) {
@@ -41462,19 +41463,16 @@ int ds4_gpu_routed_moe_one_tensor(
                     (use_iq2_selected_slots ? "exact-cache" : q4_selected_view_mode));
                 fprintf(stderr,
                         "ds4: Metal selected views layer=%u path=%s mode=%s ids=%s "
-                        "experts=%d,%d,%d,%d,%d,%d expert_gate=%.2f MiB "
+                        "experts=",
+                        layer_index, selected_path, selected_view_mode,
+                        selected_id_source);
+                for (uint32_t i = 0; i < n_expert; i++)
+                    fprintf(stderr, "%s%d", i ? "," : "",
+                            selected_ids_available ? selected_ids[i] : -1);
+                fprintf(stderr,
+                        " expert_gate=%.2f MiB "
                         "expert_down=%.2f MiB read=%.3f ms bind=%.3f ms "
                         "cache_hits=%llu cache_misses=%llu cache_wraps=%llu cache_evictions=%llu\n",
-                        layer_index,
-                        selected_path,
-                        selected_view_mode,
-                        selected_id_source,
-                        selected_ids_available ? selected_ids[0] : -1,
-                        selected_ids_available ? selected_ids[1] : -1,
-                        selected_ids_available ? selected_ids[2] : -1,
-                        selected_ids_available ? selected_ids[3] : -1,
-                        selected_ids_available ? selected_ids[4] : -1,
-                        selected_ids_available ? selected_ids[5] : -1,
                         ds4_gpu_mib(gate_expert_bytes),
                         ds4_gpu_mib(down_expert_bytes),
                         selected_read_ms,

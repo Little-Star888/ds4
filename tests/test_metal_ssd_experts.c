@@ -1,0 +1,115 @@
+#define _DARWIN_C_SOURCE
+#include "ds4_gpu.h"
+
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+enum { D = 256, H = 512, E = 256, N = 8, STEPS = 48 };
+typedef struct { uint16_t d; uint8_t qs[64]; } iq2_block;
+
+static uint32_t rng = 1;
+static uint32_t random_u32(void) {
+    rng ^= rng << 13;
+    rng ^= rng >> 17;
+    rng ^= rng << 5;
+    return rng;
+}
+
+int main(void) {
+    const uint64_t row = sizeof(iq2_block);
+    const uint64_t expert = H * row;
+    const uint64_t tensor = E * expert;
+    const size_t bytes = 3 * tensor;
+    FILE *file = tmpfile();
+    if (!file || ftruncate(fileno(file), bytes)) return 1;
+    void *model = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED,
+                       fileno(file), 0);
+    if (model == MAP_FAILED) return 1;
+    iq2_block *block = model;
+    for (size_t i = 0; i < bytes / sizeof(*block); i++) {
+        block[i].d = 0x1400;
+        for (size_t j = 0; j < sizeof(block[i].qs); j++)
+            block[i].qs[j] = random_u32();
+    }
+    int ok = msync(model, bytes, MS_SYNC) == 0 && ds4_gpu_init();
+    ds4_gpu_set_quality(false);
+    ds4_gpu_set_glm_model(true);
+    ds4_gpu_set_ssd_streaming(true);
+    ds4_gpu_set_streaming_expert_cache_budget(16);
+    ds4_gpu_set_streaming_expert_cache_expert_bytes(expert * 3);
+    ok = ok && ds4_gpu_set_model_map(model, bytes) &&
+         ds4_gpu_set_model_fd(fileno(file));
+    float x[D], weights[N], reference[D], actual[D], first_pass[STEPS][D];
+    int32_t ids[N];
+    for (int i = 0; i < D; i++) x[i] = ((int)(random_u32() % 101) - 50) / 256.0f;
+    for (int i = 0; i < N; i++) weights[i] = (i + 1) / 36.0f;
+    ds4_gpu_tensor *xt = ds4_gpu_tensor_alloc(sizeof(x));
+    ds4_gpu_tensor *it = ds4_gpu_tensor_alloc(sizeof(ids));
+    ds4_gpu_tensor *wt = ds4_gpu_tensor_alloc(sizeof(weights));
+    ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc(N * H * sizeof(float));
+    ds4_gpu_tensor *up = ds4_gpu_tensor_alloc(N * H * sizeof(float));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(N * H * sizeof(float));
+    ds4_gpu_tensor *down = ds4_gpu_tensor_alloc(N * D * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(sizeof(actual));
+    ok = ok && xt && it && wt && gate && up && mid && down && out &&
+         ds4_gpu_tensor_write(xt, 0, x, sizeof(x)) &&
+         ds4_gpu_tensor_write(wt, 0, weights, sizeof(weights));
+    /* Move the missing slots through all eight positions. Every fourth
+     * route is all-hit; the cache is too small to retain the whole sequence. */
+    for (int step = 0; step < STEPS * 2 && ok; step++) {
+        const int turn = step % STEPS;
+        const uint32_t budget = step < STEPS ? 16u : 24u;
+        if (step == STEPS) {
+            ds4_gpu_set_streaming_expert_cache_budget(budget);
+        }
+        if (turn % 4 != 3) {
+            for (int i = 0; i < N; i++) {
+                const int slot = (i + turn) % N;
+                ids[slot] = i < 4 ? i : 4 + (turn * 4 + i) % (E - 4);
+            }
+        }
+        ok = ds4_gpu_tensor_write(it, 0, ids, sizeof(ids));
+        for (int streamed = 0; streamed < 2 && ok; streamed++) {
+            ok = ds4_gpu_tensor_fill_f32(mid, NAN, N * H) &&
+                 ds4_gpu_tensor_fill_f32(out, NAN, D) &&
+                 ds4_gpu_begin_commands() &&
+                 ds4_gpu_routed_moe_one_tensor(
+                    out, gate, up, mid, down, model, bytes, 0, tensor, 2 * tensor,
+                    16, 16, expert, row, expert, 2 * row, D, H, D,
+                    it, wt, E, N, 7.0f, xt, NULL, 3, !streamed) &&
+                 ds4_gpu_end_commands() &&
+                 ds4_gpu_tensor_read(out, 0, streamed ? actual : reference,
+                                      sizeof(actual));
+        }
+        for (int i = 0; i < D && ok; i++) {
+            if (!isfinite(actual[i]) || !isfinite(reference[i]) ||
+                fabsf(actual[i] - reference[i]) > 2e-5f * (1 + fabsf(reference[i]))) {
+                fprintf(stderr, "SSD expert mismatch step=%d element=%d ref=%g actual=%g\n",
+                        step, i, reference[i], actual[i]);
+                ok = 0;
+            }
+        }
+        if (step < STEPS) memcpy(first_pass[turn], actual, sizeof(actual));
+        else if (memcmp(first_pass[turn], actual, sizeof(actual))) {
+            fprintf(stderr, "SSD cache capacity changed output at step %d\n", turn);
+            ok = 0;
+        }
+        const uint32_t cached = ds4_gpu_stream_expert_cache_current_count();
+        if (cached == 0 || cached > budget) ok = 0;
+        if (turn == STEPS / 2) ds4_gpu_stream_expert_cache_reset_route_hotness();
+    }
+    ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(it); ds4_gpu_tensor_free(wt);
+    ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(up); ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(down); ds4_gpu_tensor_free(out);
+    ds4_gpu_print_memory_report("SSD expert test");
+    ds4_gpu_cleanup();
+    munmap(model, bytes);
+    fclose(file);
+    fprintf(stderr, "Metal SSD IQ2 eight-expert eviction: %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
