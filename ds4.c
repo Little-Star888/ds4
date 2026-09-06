@@ -49720,11 +49720,13 @@ static bool glm_graph_forward_indexed_tokens(
     const uint32_t drain_interval =
         progress_flush_interval != 0 ? glm_graph_indexed_prefill_drain_interval() : 0u;
     const bool progress_requested = display_progress && work_total > 0;
-    /* The first large chunk has a cold cache and touches most experts. Read
-     * complete layers, keeping one read ahead; later chunks reuse the cache. */
+    /* Generic IQ2 GLM benefits from sequential layer reads on large continued
+     * chunks too. Keep the typed Flash path's selected-expert cache reuse. */
     const bool full_layer_prefill =
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
-        pos0 == 0 && n_tokens >= 256u && use_batch_ffn && !g->quality &&
+        (pos0 == 0 || (!g->glm53 && glm_graph_layer_uses_generic_routed_moe(
+                                      &weights->layer[DS4_N_LEADING_DENSE]))) &&
+        n_tokens >= 256u && use_batch_ffn && !g->quality &&
         g->tp_world < 2 &&
         g->layer_start == 0 && g->layer_count == glm_graph_normal_layer_count() &&
         glm_graph_stream_prefill_full_layer_enabled(g, n_tokens);
