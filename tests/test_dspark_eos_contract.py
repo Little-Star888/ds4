@@ -141,9 +141,8 @@ static bool metal_graph_read_spec_logits_row(ds4_gpu_graph *g,uint32_t row,float
     return !fail_read;
 }
 static bool ds4_session_dspark_seed_batch_enabled(ds4_session *s) { (void)s; return seed_batch; }
-static inline bool ds4_session_dspark_seed_batch_short_fallback(const ds4_session *s) {
-    return s->engine->backend == DS4_BACKEND_METAL;
-}
+#define ds4_session_dspark_seed_batch_short_fallback(s) \
+    ((s)->engine->backend == DS4_BACKEND_METAL)
 static void ds4_session_dspark_capture_invalidate(ds4_session *s) { (void)s; }
 static bool spec_frontier_commit_prefix(ds4_session *s,uint32_t n) {
     if(n==0 || n>4 || n>=(uint32_t)verified_width) { mock_errors++; return false; }
