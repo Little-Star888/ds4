@@ -2263,7 +2263,7 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
 
     char c;
     int nread;
-    char seq[32];
+    char seq[32] = {0};
     size_t seq_len = 0;
 
     if (l->paste_active)
