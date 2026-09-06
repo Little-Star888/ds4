@@ -57,10 +57,10 @@ Non-routed weights and KV state are additional to that expert-cache budget.
 A plain number, such as `--ssd-streaming-cache-experts 4000`, requests dynamic
 expert slots rather than a byte budget. It is also subject to memory limits.
 
-GLM can keep an initial set of full routed layers resident and use the remaining
-budget for cached experts. The report identifies a global decode map or a
-lower-memory per-layer fallback. Leave this selection automatic unless you are
-investigating a specific problem.
+By default, GLM spends the cache budget on selected experts across all layers.
+`--ssd-streaming-full-layers N` reserves full routed prefix layers instead.
+Metal also keeps the non-routed weights resident when it can; they are needed
+by every token, and paging them back in delays generation after a prompt.
 
 More context and more server sessions consume more memory. Metal GLM budgeting
 includes planned and already resident sessions; a request can still be refused
@@ -70,3 +70,18 @@ a remedy for insufficient RAM.
 Leave expert preloading enabled for normal use. `--ssd-streaming-cold` and
 `--ssd-streaming-preload-experts N` are mainly useful for controlled measurements.
 See [benchmarking](PERFORMANCE.md) and the [release QA guide](../QA_BEFORE_RELEASES.md).
+
+## M5 Max measurements
+
+On a 128 GB M5 Max, with automatic cache sizing and no speculative decoding:
+
+| Model | Initial prefill | Continued prefill | Generation after each |
+| --- | ---: | ---: | ---: |
+| GLM 5.3 Flash Q4_K, 177.77 GiB | 121 t/s | 104 t/s | 11.9 / 14.9 t/s |
+| DeepSeek Flash Vision Exp MXFP4, 145.26 GiB | 297 t/s | 259 t/s | 7.9 / 11.6 t/s |
+
+September 6, 2026 medians of three runs. GLM used a 2K prompt, a 1K append,
+and 128 generated tokens at each frontier; DeepSeek used 8K, a 4K append,
+and 64 generated tokens. Generation includes the first-token wait. Cache
+reuse depends on the prompt, so these are workload references, not a speed
+guarantee for every model larger than RAM.

@@ -713,6 +713,19 @@ SSD streaming is a capacity path, so test both correctness and user experience.
   global or per-layer decode map, and total planned memory.
 - If streaming cache internals changed, test the same prompt twice and compare
   first-token/logprob sanity between runs.
+- On Metal, compare the complete prefill logits with the previous executable
+  at 2K/3K and 8K/12K frontiers, with generation and continued prefill between
+  them. Exercise initial whole-layer reads, later selected-expert reads, cold
+  caches and a mixed-size expert layer. Record initial and continued speed
+  separately, including the first decode step rather than only steady speed.
+- Deny the first static-weight `mlock` in a test build or interposer. Startup
+  must leave those weights pageable and continue with correct output. Do not
+  confuse this with denying every lock: the existing expert cache also needs
+  locked buffers. Keep external memory monitoring enabled; do not deliberately
+  trigger system OOM or a GPU watchdog reset.
+- Run the section 12 coding-client and prefix-replay checks with a model
+  larger than RAM and automatic SSD cache sizing, for both DeepSeek and GLM.
+  A resident model pass does not exercise cache evictions after tool results.
 - On an idle M5 Max, run the full GLM 5.3 Q2 SSD-streaming regression with the
   16 GiB expert budget. Use the release GGUF and verify its checksum before
   comparing results. The current reference file is
@@ -734,17 +747,64 @@ SSD streaming is a capacity path, so test both correctness and user experience.
     -p "Write the word apple exactly 100 times, separated by one space. Do not stop early and output nothing else."
   ```
 
-  The first command must report 463 input tokens, produce a coherent answer
-  about component gamma, and keep median prefill at or above 11.3 t/s. The
+  The first command must report 463 input tokens and keep median prefill at
+  or above 11.3 t/s. It truncates the archive before its final question, so it
+  is a timing input, not a sufficient quality test. Repeat with an explicit
+  final question asking which component reports anomalies; require gamma. The
   second must emit all 64 requested output tokens and keep median generation at
   or above 5.5 t/s. The M5 Max reference medians are 12.59 and 6.14 t/s. Startup
-  should plan about 18.03 GiB at this context and initially restrict the model
+  should plan about 39.63 GiB at this context, including 22.55 GiB of static
+  model mapping, and initially restrict the model
   map to the token embedding. GLM must demand-fill its expert cache by default;
   an ordinary run and `--ssd-streaming-cold` should have comparable cache-miss
   counts and speed unless an explicit preload count or diagnostic cap is used.
   A memory guard or static decode map that accounts nearly the full 196.58 GiB
   GGUF, a Metal OOM, repeated garbage tokens, or a compact-attention result
   that omits the RoPE score is a release blocker.
+
+September 6 focused SSD pass, 128 GB M5 Max only: GLM 5.3 Flash Q4_K
+(177.77 GiB) and DeepSeek Flash Vision Exp MXFP4 (145.26 GiB). Automatic
+budgets and existing prefill chunk sizes were used, without speculation.
+The following are three-run medians; the final GLM prefill variant was
+repeated after the interleaved cache-policy comparison.
+
+| Workload | Prefill before / after | Generation before / after |
+| --- | ---: | ---: |
+| GLM, initial 2K, 128 output tokens | 111.73 / 121.28 t/s | 6.11 / 11.85 t/s |
+| GLM, 1K append, 128 output tokens | 83.33 / 104.43 t/s | 7.11 / 14.89 t/s |
+| DeepSeek, initial 8K, 64 output tokens | 285.12 / 296.59 t/s | 7.21 / 7.91 t/s |
+| DeepSeek, 4K append, 64 output tokens | 257.07 / 259.44 t/s | 9.42 / 11.58 t/s |
+
+All compared full logits were exact: GLM at 2K/3K and 8K/12K, DeepSeek at
+8K/12K. Matching official-continuation subsets were also identical: GLM
+24 cases, 2,963 tokens, NLL `0.309656938`; DeepSeek Vision Exp 12 cases,
+768 tokens, NLL `0.163628345`. These are not complete 100-case quality passes.
+Automatic, cold, one-slot and 500 GiB-hint GLM checks preserved exact logits.
+The one-slot run was shortened after direct reads took about 31 seconds per
+token. The oversized hint was safely reduced but decoded at only 0.36 t/s;
+automatic sizing remains the practical default. Denying just the static lock
+passed; denying all memory locks failed cleanly in the expert cache.
+
+Full non-Flash GLM Q2 is NOT quality-signed-off by this pass. The checksum
+above matches, but the truncated archive produced the same poor continuation
+in the saved baseline and candidate. An explicit question also failed in the
+candidate. Its 512-token full logits were identical with and without the new
+prefill and cache seeding; that establishes no regression in those logits,
+not good model quality. Investigate this separately before release.
+
+Real Pi coding sessions passed with both larger-than-RAM Flash models above:
+read, edit, write, warning-strict C builds, test execution, an intentional
+missing-file error and recovery, then another edit/test round. Independent
+exhaustive C oracles passed. The DeepSeek and GLM conversations reached
+7,360 and 7,111 tokens; every tool-result continuation reused its full live
+prefix. Pi's subsequent compaction requests correctly rebuilt shorter prompts.
+Separate 4.6K-4.8K tool-history checks returned GREEN on replay and BLUE after
+editing the tool result, matching a fresh server. These earlier-prefix replays
+required rebuilds: GLM reported a 4,615-token match but rebuilt its recurrent
+state in about 40 seconds; DeepSeek rebuilt the compressed history. Do not
+count a reported matched prefix as saved computation without checking this log.
+No OOM, GPU reset or memory-pressure termination occurred. This pass did not
+test M3, CUDA, ROCm, physical TP, vision or speculative SSD decoding.
 
 ## 8. CUDA / DGX Spark
 
