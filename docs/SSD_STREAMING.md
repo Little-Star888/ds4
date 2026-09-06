@@ -89,3 +89,10 @@ directly comparable to the earlier 64-token measurement. Generation includes
 the first-token wait. Cache reuse depends on the prompt, so these are
 workload references, not a speed
 guarantee for every model larger than RAM.
+
+Full GLM 5.3 IQ2_XXS (196.58 GiB) also benefits from caching short tool-result
+prompts. With an 8K context and a 61.35 GiB effective expert cache, a 16-token
+append fell from 30.8 to 2.9 seconds; generation afterward rose from 4.09 to
+5.11 t/s (three-run medians, 64 generated tokens). All compared logits and
+generated text were identical. This is a short-append improvement, not an
+equivalent gain in initial prefill or every generation workload.

@@ -717,15 +717,29 @@ SSD streaming is a capacity path, so test both correctness and user experience.
   precision or activation precision. With the same model and prefill chunks,
   require identical complete logits and deterministic output across cache
   policies. Test numerical-kernel changes separately against a reference.
-- Run `MTL_DEBUG_LAYER=1 make test-metal-ssd-experts` on an idle Metal host. It exercises all
-  eight routed slots through hits and evictions, requires byte-identical
+- Run `MTL_DEBUG_LAYER=1 make test-metal-ssd-experts` on an idle Metal host.
+  It exercises all eight routed slots through hits and evictions, requires byte-identical
   outputs with different cache capacities, and replaces more than 4,096
   layer mappings while retaining a separate auxiliary model mapping.
+  For cached-batch changes, also run
+  `MTL_DEBUG_LAYER=1 ./tests/test_metal_ssd_experts --full-glm-shape`.
+  This uses full GLM's 6144/2048 expert dimensions, repeated batch sizes and
+  evictions, and checks intermediate activations and output byte-for-byte.
+  Include the 255/256/257-token dispatch boundary and an undersized cache.
+  Repeat with `DS4_METAL_DISABLE_METAL4=1` to cover the conventional kernels.
+- Run `MTL_DEBUG_LAYER=1 make test-glm-attention` and a real server coding
+  session with validation enabled. Irregular context lengths must work, not
+  just round benchmark sizes. Preserve validation failures and fix their cause;
+  disabling validation is not a passing result.
 - On Metal, compare the complete prefill logits with the previous executable
   at 2K/3K and 8K/12K frontiers, with generation and continued prefill between
   them. Exercise initial whole-layer reads, later selected-expert reads, cold
   caches and a mixed-size expert layer. Record initial and continued speed
   separately, including the first decode step rather than only steady speed.
+  Save the exact commands and prompt files with each comparison. Equal context
+  lengths do not imply equal input tokens. For short tool-result appends, test
+  16, 43 and 114 tokens as well, followed by generation: a faster append must
+  not merely move its I/O cost into the next decode steps.
 - Deny the first static-weight `mlock` in a test build or interposer. Startup
   must leave those weights pageable and continue with correct output. Do not
   confuse this with denying every lock: the existing expert cache also needs
@@ -870,15 +884,63 @@ Its real Pi coding task passed again with automatic cache sizing and an
 independent C oracle. Model-free frontend, agent, session-state, TP-command,
 SSD-cache, attention and eight-expert eviction/mapping tests passed on M5.
 
-Full non-Flash GLM's real Pi task did NOT pass: after several successful
+Additional Metal API validation found two independent issues: managed-storage
+notifications on shared buffers, and GLM attention scratch lengths that were
+not multiples of 16 bytes. The notifications were removed and the scratch
+allocations padded without changing the computed values. Irregular-length
+attention tests pass against the numerical oracle with validation enabled.
+Validated real Pi coding sessions now pass for Flash Q4 and DeepSeek Vision
+Exp MXFP4, reaching 7.2K and 7.6K context with independent C oracles. Minimum
+available memory was 13.21 and 7.40 GiB, respectively, with no swap growth.
+The validated Flash MTP snapshot test also passes. These runs overlapped a
+model download, so their elapsed times are not performance references.
+
+Full GLM short-append cache checks used the code-audit prompt, 1,024 initial
+tokens, an 8K allocation, a 66 GB cache hint (61.35 GiB effective), forced
+snapshot restoration and 64 greedy output tokens at each frontier. The control
+set `DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR=1`.
+All 154,880 logits and complete generated text matched in every pair.
+
+| Append | Time before / after | Generation afterward | Repetitions |
+| --- | ---: | ---: | --- |
+| 16 tokens | 30.8 / 2.9 s | 4.09 / 5.11 t/s | Three-run medians |
+| 43 tokens | 34.4 / 5.4 s | 4.00 / 5.34 t/s | One pair |
+| 114 tokens | 34.9 / 8.7 s | 3.90 / 5.39 t/s | One pair |
+
+The 16-token runs' initial prefill medians were 55.92/55.16 t/s and initial
+generation 4.14/3.78 t/s; do not claim a general decode improvement from the
+post-append result. No run grew swap or raised memory pressure; minimum
+available memory across these runs was 15.05 GiB. These performance tests
+ran after the model download and checksum verification had finished.
+
+The full GLM Q2 Pi retry on IT passed with Metal API validation and automatic
+cache sizing (69.51 GiB). It read the project, fixed the function, wrote tests,
+corrected its own test expectation and case count, and passed both its 726-case
+test and the independent C oracle. The session reached 8,416 tokens; ordinary
+tool-result turns reused their complete live prefixes, while Pi's final
+compaction correctly started a new 273-token prompt. The complete task took
+795.58 seconds, with at least 11.40 GiB available and no swap growth or API
+validation error. This is a workflow result, not a paired speed benchmark.
+Full GLM's validated MTP snapshot check also passed at 3,778 prompt tokens:
+16 replayed cycles committed the same 20 tokens and restored the same top
+logits, followed by four context-reuse cycles. Minimum available memory was
+15.01 GiB with the 61.35 GiB cache, without swap growth.
+The final full-model 8K/12K snapshot regression preserved every logit from
+the earlier reference. With the smaller 35.36 GiB cache it measured 94.81/91.08
+t/s prefill and 3.62/3.81 t/s generation (16 tokens), with at least 27.88 GiB
+available and no swap growth. The reference ran on the other M5, so this is
+a correctness and memory regression check, not a new paired speed claim.
+
+The earlier US full non-Flash GLM Pi task did NOT pass: after several successful
 tool calls, a reader stalled inside `pread` near 5.2K context. The external
 guard timed out. Kernel stacks later showed the terminated server still
 waiting in APFS `cluster_read_ext`; an independent process could not even
 open the same GGUF (`apfs_io_lock_exclusive`). Available memory recovered,
 but killing the processes did not clear the filesystem wait. The cause is
-not established. Do not label the full-model server path release-ready
-until this is resolved and the coding task passes. The DeepSeek and GLM
-Flash coding passes above are separate results.
+not established. The IT coding pass does not resolve this US failure: clear
+the filesystem wait and repeat the US test before signing off that host.
+No reboot was performed without permission; an unrelated Claude session
+was still running there.
 
 ## 8. CUDA / DGX Spark
 
