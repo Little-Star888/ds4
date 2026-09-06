@@ -70317,6 +70317,16 @@ static int ds4_session_eval_dspark_speculative_argmax(
             return n_accept;
         }
     }
+    if (!ignore_eos) {
+        /* Keep the verified state at the same frontier as the returned tokens,
+         * including when a fused seed moves EOS into the draft interior. */
+        for (int i = 0; i < draft_n; i++) {
+            if (drafts[i] == eos_token) {
+                draft_n = i + 1;
+                break;
+            }
+        }
+    }
     if (stats_enabled) {
         s->dspark_stats.proposed_tokens += (uint64_t)(draft_n - seed_tokens);
         ds4_dspark_stats_note_len(s->dspark_stats.draft_len_hist,
