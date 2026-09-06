@@ -21574,6 +21574,17 @@ bad_line:
     return true;
 }
 
+static uint32_t metal_graph_streaming_builtin_hotness(uint32_t remaining,
+                                                     uint32_t total) {
+#ifdef __APPLE__
+    /* List rank is a preload preference, not thousands of observed routes. */
+    return 1u + (uint32_t)(31ull * remaining / total);
+#else
+    (void)total;
+    return remaining;
+#endif
+}
+
 static bool metal_graph_streaming_expert_hotlist_load_default(
         uint32_t    max_entries,
         int32_t     experts[DS4_MAX_LAYER][DS4_MAX_EXPERT],
@@ -21606,7 +21617,8 @@ static bool metal_graph_streaming_expert_hotlist_load_default(
         if (!metal_graph_streaming_expert_hotlist_add(
                 hotlist[i][0],
                 hotlist[i][1],
-                max_entries - loaded,
+                metal_graph_streaming_builtin_hotness(max_entries - loaded,
+                                                       max_entries),
                 experts,
                 priorities,
                 counts,
@@ -21724,7 +21736,8 @@ static bool metal_graph_seed_streaming_expert_cache_layer_from_mapped_hotlist(
         const uint32_t hot_layer = hotlist[i][0];
         const uint32_t hot_expert = hotlist[i][1];
         if (hot_layer >= DS4_N_LAYER || hot_expert >= DS4_N_EXPERT) continue;
-        const uint32_t priority = preload_count - loaded;
+        const uint32_t priority = metal_graph_streaming_builtin_hotness(
+                preload_count - loaded, preload_count);
         loaded++;
         if (hot_layer != il) continue;
         if (n >= DS4_MAX_EXPERT) return false;
