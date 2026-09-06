@@ -41062,6 +41062,19 @@ int ds4_gpu_routed_moe_one_tensor(
                     selected_id_source = "override";
                     selected_exec_ids_from_host = true;
                     g_routed_moe_selected_override_n = 0;
+                } else if (use_stream_expert_cache &&
+                           ds4_gpu_glm_stream_selected_prefetch_take(
+                               model_map, model_size, layer_index,
+                               n_total_expert, n_expert,
+                               gate_offset, up_offset, down_offset,
+                               gate_expert_bytes, down_expert_bytes,
+                               selected_ids)) {
+                    /* GLM already read these IDs to start loading experts.
+                     * Submit the shared expert work while the reads finish. */
+                    selected_id_source = "prefetched";
+                    if (g_batch_cb && g_batch_has_work &&
+                        g_stream_expert_pending_load.active &&
+                        !ds4_gpu_flush_commands()) return 0;
                 } else if (use_stream_hit_validator) {
                     g_routed_moe_selected_override_n = 0;
                     uint32_t validator_all_cached = 0;
