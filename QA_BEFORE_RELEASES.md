@@ -713,6 +713,14 @@ SSD streaming is a capacity path, so test both correctness and user experience.
   global or per-layer decode map, and total planned memory.
 - If streaming cache internals changed, test the same prompt twice and compare
   first-token/logprob sanity between runs.
+- Cache and I/O optimizations must not change routed expert counts, weight
+  precision or activation precision. With the same model and prefill chunks,
+  require identical complete logits and deterministic output across cache
+  policies. Test numerical-kernel changes separately against a reference.
+- Run `make test-metal-ssd-experts` on an idle Metal host. It exercises all
+  eight routed slots through hits and evictions, requires byte-identical
+  outputs with different cache capacities, and replaces more than 4,096
+  layer mappings while retaining a separate auxiliary model mapping.
 - On Metal, compare the complete prefill logits with the previous executable
   at 2K/3K and 8K/12K frontiers, with generation and continued prefill between
   them. Exercise initial whole-layer reads, later selected-expert reads, cold
@@ -770,6 +778,14 @@ SSD streaming is a capacity path, so test both correctness and user experience.
   nonzero RoPE against a double-precision reference with F16/F32 caches,
   initial and continued prefill, and incomplete head groups.
 
+  Also test an 8K prompt followed by a 4K append at a 16K context with the
+  automatic cache and an explicit cache target. This crosses compact-indexer
+  warmup, which reads weights from earlier layers after prefill releases their
+  mappings. Compare full logits and monitor memory throughout, not just startup.
+  For `ds4-bench`, use `DS4_BENCH_FORCE_SNAPSHOT=1` when the extra snapshot fits;
+  otherwise its large-payload fallback replays the prefix and changes the cache
+  state before the append. Record which restoration method was used.
+
 September 6 focused SSD pass, 128 GB M5 Max only: GLM 5.3 Flash Q4_K
 (177.77 GiB) and DeepSeek Flash Vision Exp MXFP4 (145.26 GiB). Automatic
 budgets and existing prefill chunk sizes were used, without speculation.
@@ -793,12 +809,14 @@ token. The oversized hint was safely reduced but decoded at only 0.36 t/s;
 automatic sizing remains the practical default. Denying just the static lock
 passed; denying all memory locks failed cleanly in the expert cache.
 
-Full non-Flash GLM Q2 is NOT quality-signed-off by this pass. The checksum
-above matches, but the truncated archive produced the same poor continuation
-in the saved baseline and candidate. An explicit question also failed in the
-candidate. Its 512-token full logits were identical with and without the new
-prefill and cache seeding; that establishes no regression in those logits,
-not good model quality. Investigate this separately before release.
+The initial full non-Flash GLM Q2 check exposed a pre-existing correctness
+bug: compact dense prefill omitted its RoPE score. Flash has no RoPE score and
+could not reveal it. The corrected dispatch passes the independent attention
+oracle and a real-model comparison with the general attention path: all
+154,880 logits match and the complete archive question returns gamma. This
+is separate from the output-identical cache changes. No matching full GLM 5.3
+official-continuation suite was available; do not use Flash vectors to sign
+off that checkpoint.
 
 Real Pi coding sessions passed with both larger-than-RAM Flash models above:
 read, edit, write, warning-strict C builds, test execution, an intentional
@@ -811,8 +829,56 @@ editing the tool result, matching a fresh server. These earlier-prefix replays
 required rebuilds: GLM reported a 4,615-token match but rebuilt its recurrent
 state in about 40 seconds; DeepSeek rebuilt the compressed history. Do not
 count a reported matched prefix as saved computation without checking this log.
-No OOM, GPU reset or memory-pressure termination occurred. This pass did not
+No OOM, GPU reset or memory-pressure termination occurred in the initial pass. It did not
 test M3, CUDA, ROCm, physical TP, vision or speculative SSD decoding.
+
+The follow-up retained a larger automatic DeepSeek cache (86.20 GiB on these
+hosts), bounded preload priorities, and the correct aging clock for GLM's
+first routed layer. A same-cache coding comparison reduced DeepSeek expert
+read bytes from 94.65 to 78.18 GiB and raised initial generation from 18.49
+to 19.83 t/s; continued generation was neutral at 24.62/24.55 t/s. These are
+application read counts, not a measurement of physical SSD traffic.
+
+Later single-run comparisons, with unchanged precision and prompt chunks:
+
+| Workload | Prefill before / after | Generation before / after |
+| --- | ---: | ---: |
+| DeepSeek MXFP4, 8K, 128 output tokens | 280.97 / 299.87 t/s | 10.42 / 11.90 t/s |
+| DeepSeek MXFP4, 4K append, 128 output tokens | 261.40 / 263.32 t/s | 16.15 / 19.34 t/s |
+| Full GLM Q2, 8K, 16 output tokens | 63.23 / 90.70 t/s | 2.93 / 3.69 t/s |
+| Full GLM Q2, 4K append, 16 output tokens | 61.56 / 84.31 t/s | 3.85 / 3.96 t/s |
+
+Full GLM used the same 35.36 GiB expert cache, 16K context, and snapshot
+restoration in both runs. Its 512-token append also improved from 14.64 to
+26.01 t/s with the larger cache. Every compared full logit at 8K/12K is exact;
+Flash Q4's 2K/3K logits remain exact too. The earlier matching official subsets
+remain unchanged after the DeepSeek cache-policy update.
+
+Bounded Metal model views fix a separate memory problem: single spans used
+to retain earlier layers. Two old-mapping/control runs with a 61.35 GiB cache
+were stopped by the external guard for swap growth, without a reboot or GPU
+reset. The corrected full-GLM 8K/12K run completed with no new swap and at
+least 15.41 GiB available. It decoded 64 tokens at 5.79/5.94 t/s; that run
+replayed the prefix before appending. At the smaller cache, the snapshot-based
+comparison above improved minimum available memory from 11.11 to 27.87 GiB.
+These successful runs do not erase the failed controls.
+
+The final Flash Q4 MTP snapshot check passed at 3,778 prompt tokens: 16 replayed
+cycles, 12 single-token and four double-token outcomes, identical committed
+tokens and restored top logits, followed by four context-reuse cycles.
+Its real Pi coding task passed again with automatic cache sizing and an
+independent C oracle. Model-free frontend, agent, session-state, TP-command,
+SSD-cache, attention and eight-expert eviction/mapping tests passed on M5.
+
+Full non-Flash GLM's real Pi task did NOT pass: after several successful
+tool calls, a reader stalled inside `pread` near 5.2K context. The external
+guard timed out. Kernel stacks later showed the terminated server still
+waiting in APFS `cluster_read_ext`; an independent process could not even
+open the same GGUF (`apfs_io_lock_exclusive`). Available memory recovered,
+but killing the processes did not clear the filesystem wait. The cause is
+not established. Do not label the full-model server path release-ready
+until this is resolved and the coding task passes. The DeepSeek and GLM
+Flash coding passes above are separate results.
 
 ## 8. CUDA / DGX Spark
 

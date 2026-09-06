@@ -61,6 +61,8 @@ By default, GLM spends the cache budget on selected experts across all layers.
 `--ssd-streaming-full-layers N` reserves full routed prefix layers instead.
 Metal also keeps the non-routed weights resident when it can; they are needed
 by every token, and paging them back in delays generation after a prompt.
+An oversized expert cache can displace those weights and slow decoding.
+More cache helps only while the rest of the working set still fits.
 
 More context and more server sessions consume more memory. Metal GLM budgeting
 includes planned and already resident sessions; a request can still be refused
@@ -75,13 +77,15 @@ See [benchmarking](PERFORMANCE.md) and the [release QA guide](../QA_BEFORE_RELEA
 
 On a 128 GB M5 Max, with automatic cache sizing and no speculative decoding:
 
-| Model | Initial prefill | Continued prefill | Generation after each |
-| --- | ---: | ---: | ---: |
-| GLM 5.3 Flash Q4_K, 177.77 GiB | 121 t/s | 104 t/s | 11.9 / 14.9 t/s |
-| DeepSeek Flash Vision Exp MXFP4, 145.26 GiB | 297 t/s | 259 t/s | 7.9 / 11.6 t/s |
+| Model | Initial prefill | Continued prefill | Generation after each | Runs |
+| --- | ---: | ---: | ---: | --- |
+| GLM 5.3 Flash Q4_K, 177.77 GiB | 121 t/s | 104 t/s | 11.9 / 14.9 t/s | Three-run median |
+| DeepSeek Flash Vision Exp MXFP4, 145.26 GiB | 300 t/s | 263 t/s | 11.9 / 19.3 t/s | Single run |
 
-September 6, 2026 medians of three runs. GLM used a 2K prompt, a 1K append,
-and 128 generated tokens at each frontier; DeepSeek used 8K, a 4K append,
-and 64 generated tokens. Generation includes the first-token wait. Cache
-reuse depends on the prompt, so these are workload references, not a speed
+September 6, 2026. GLM used a 2K prompt and a 1K append; DeepSeek used 8K
+and a 4K append. Both generated 128 tokens at each frontier. DeepSeek's latest
+run uses an 86.2 GiB expert cache and updated eviction priorities; it is not
+directly comparable to the earlier 64-token measurement. Generation includes
+the first-token wait. Cache reuse depends on the prompt, so these are
+workload references, not a speed
 guarantee for every model larger than RAM.
